@@ -2,7 +2,7 @@
 
 **A regime-aware, distilled neural sea-ice closure for a GCM without prognostic ocean state.**
 
-This repository implements a sea-ice concentration (SIC) parameterisation in PyTorch and a two-file Julia interface for [SpeedyWeather.jl](https://github.com/SpeedyWeather/SpeedyWeather.jl). The deployed mid-SIC student contains **13,574 trainable parameters**. The emphasis is on a difficult *physical closure* problem, due to the lack of a complete set of ocean-side variables in the atmospheric GCM.
+This repository implements a sea-ice concentration (SIC) parameterisation in PyTorch and a two-file Julia interface for [SpeedyWeather.jl](https://github.com/SpeedyWeather/SpeedyWeather.jl). The deployed mid-SIC student contains **13,574 trainable parameters**. The central challenge is a physically underdetermined closure problem arising from the absence of essential ocean-state variables in the atmospheric GCM.
 
 ![Arctic, one-year offline rollout](docs/rollout_2017_north.gif)
 
@@ -23,13 +23,13 @@ This repository implements a sea-ice concentration (SIC) parameterisation in PyT
 
 ![Held-out seasonal cycles](docs/rollout_seasonal_cycle.png)
 
-The summer minimum remains challenging. These results establish useful offline feedback behaviour under observed atmospheric forcing, **not** guaranteed stability or predictive skill under arbitrary coupled GCM states.
+The summer minimum remains challenging. These results demonstrate year-long feedback behaviour under observed atmospheric forcing.
 
 ## Why this is a difficult closure problem
 
 Sea-ice evolution depends on ocean heat exchange, thermodynamics and transport, yet the target GCM does not expose the ocean variables required to determine the ice tendency uniquely. History, neighbouring-cell information and network capacity help, but cannot restore the missing state. Multiple learned operators can fit the same reanalysis data and still disagree strongly under changed forcing or repeated coupling.
 
-The modelling objective is therefore **not simply to minimise one-step error**. It is to constrain the admissible response of an underdetermined operator so that its extrapolation is physically credible. This motivates regime-specific architectures, derivative penalties evaluated at real **and synthetic** states, self-distillation for missing inputs, and high-concentration equilibrium regularisation.
+The modelling objective is to constrain the admissible responses of an underdetermined operator, alongside minimising one-step prediction error, to support physically credible extrapolation. This motivates regime-specific architectures, derivative penalties evaluated at real **and synthetic** states, self-distillation for missing inputs, and high-concentration equilibrium regularisation.
 
 ## Model architecture and distillation
 
@@ -41,9 +41,9 @@ Three SIC regimes are combined by smooth concentration-dependent gates rather th
 | Mid SIC | `RelaxationMoEClassifier` | Seasonal tendency and relaxation in the marginal/interior pack |
 | High SIC | `RelaxationMoEClassifier` | Near-saturated Arctic ice and equilibrium response |
 
-Low and mid bands are trained on pooled hemispheric data; the high band is Arctic-only. Inputs include SIC and its history, SST (`tos`), shortwave and longwave radiative forcing, wind, near-surface air temperature (`tas`), dew point (`tdps`), seasonality, and local spatial gradient/curvature features. The exact feature contract lives in `sic_pipeline_lib.py` and notebook §1–2.
+Low and mid bands are trained on pooled hemispheric data; the high band is Arctic-only. Inputs include SIC and its history, SST (`tos`), shortwave and longwave radiative forcing, wind, near-surface air temperature (`tas`), dew point (`tdps`), seasonality, and local spatial gradient/curvature features. The exact feature contract is defined in `sic_pipeline_lib.py` and notebook §1–2.
 
-A 128-wide mid-band teacher is trained with input masking/self-distillation, followed by teacher–student distillation into a compact deployable model. **The documented offline results use `MASK_DISTILL = True`.** Distillation is intended to reduce sensitivity to missing or biased thermodynamic inputs within tested conditions.
+A 128-wide mid-band teacher is trained with input masking/self-distillation, followed by teacher–student distillation into a compact deployable model. **The documented offline results use `MASK_DISTILL = True`.** Distillation improves tolerance to missing or biased thermodynamic inputs under the tested conditions.
 
 ## Physics-constrained loss design
 
@@ -55,7 +55,7 @@ One-sided autograd penalties discourage an ice-growth tendency that increases wi
 
 ### Coherent atmospheric warming
 
-A separate directional derivative penalises a positive ice-growth response when `tas` and `tdps` rise **together**. The direction uses the feature normalisation so that the derivative corresponds to coherent physical warming, not an arbitrary change in two normalised columns. Synthetic coherent warming perturbations are used to target poorly sampled thermodynamic states, particularly dense ice under atypically cold air. Constraining only `tas` independently can miss a compensating response through `tdps`.
+A directional-derivative penalty discourages the predicted ice-growth tendency from increasing when `tas` and `tdps` rise **together**. The direction uses the feature normalisation so that the derivative corresponds to coherent physical warming, not an arbitrary change in two normalised columns. Synthetic coherent warming perturbations are used to target poorly sampled thermodynamic states, particularly dense ice under atypically cold air. Constraining only `tas` independently can miss a compensating response through `tdps`.
 
 ### Geometry-aware spatial-curvature response
 
@@ -63,7 +63,7 @@ A selective, one-sided penalty discourages the learned tendency from **amplifyin
 
 ### High-SIC equilibrium-map contraction
 
-The high-concentration relaxation model is penalised when its equilibrium-map derivative with respect to SIC exceeds the target contraction threshold. The derivative is evaluated at **synthetically sampled SIC concentrations** while retaining the sampled atmospheric forcing. A globally satisfied contraction bound would give a uniqueness result under its assumptions. Notebook §11 reports observed violations.
+The high-concentration relaxation model is penalised when its equilibrium-map derivative with respect to SIC exceeds the target contraction threshold. The derivative is evaluated at **synthetically sampled SIC concentrations** while retaining the sampled atmospheric forcing. If satisfied globally, the contraction condition would imply uniqueness of the equilibrium under the relevant mathematical assumptions. Notebook §11 reports measured violations of this condition.
 
 ### Optional response controls
 
@@ -71,11 +71,11 @@ The loss implementation also supports a wind-response penalty and response-gradi
 
 ### Why synthetic points matter
 
-The synthetic samples are more than generic data augmentation: they test **the direction of the operator's response** where observational supervision is weak. The point is to compress the effective null space of admissible closures. The executed notebook (§11) distinguishes desired inequalities from measured violation rates and input sensitivities.
+The synthetic samples are more than generic data augmentation: they test **the direction of the operator's response** where observational supervision is weak. This helps restrict the effective null space of admissible closures. The executed notebook (§11) distinguishes desired inequalities from measured violation rates and input sensitivities.
 
 ## Geometric feature and deployment consistency
 
-The physical zonal/meridional curvature feature is defined in the original implementation by
+The latitude-weighted SIC curvature feature is constructed as follows:
 
 ```text
 q = ((W - C) + (E - C))/2 + cos^2(lat) * ((N - C) + (S - C))/2
@@ -121,15 +121,13 @@ hourly accumulations and need the x24 correction.
 
 ## Running it
 
-Install `requirements.txt`, then work down the notebook in order. Every expensive stage is
-behind a flag that defaults to `False`, so opening and running the notebook top to bottom
-does nothing heavy:
+Install `requirements.txt`, then work down the notebook in order. All computationally expensive stages are controlled by flags that default to `False`, so the editable notebook can be run from top to bottom without triggering training or cache generation.
 
-The executed copy is the one to read. The plain one is the one to run.
+The executed copy is intended for reading; the editable copy is intended for running.
 
-1. **§1 Configuration** — the contract: paths, the gate, and the column definition.
+1. **§1 Configuration** — paths, blending gates, and feature-column definitions.
 2. **§2 Consistency check** — the four-way agreement described above.
-3. **§3 `BUILD_CACHE = True`** — builds the training caches from `processed/`. Hours.
+3. **§3 `BUILD_CACHE = True`** — builds the training caches from `processed/`. This step may take several hours.
 4. **§5-§8 `TRAIN_MID_TEACHER`, `TRAIN_MID`, `TRAIN_LOW`, `TRAIN_HIGH`** — the four
    networks. The mid band is two stages: a 128-wide self-distilled teacher, then the
    distillation down to the shipped width under the warming penalty.
@@ -145,7 +143,7 @@ The executed copy is the one to read. The plain one is the one to run.
    distribution and two are decades later. About 50 seconds for all eight.
 8. **§14** — the rollouts as figures: the area-weighted mean concentration through the year
    against ERA5, the field from above the pole at the summer minimum, where the error sits
-   on the map, and the whole year as an mp4 (GIF if ffmpeg is missing). Ice reads white.
+   on the map, and the whole year as an mp4 (GIF if ffmpeg is missing). Ice is shown in white.
 9. **§15** — the single-step diagnostics as figures, drawn from the arrays §10-§11 already
    built.
 
@@ -209,12 +207,12 @@ this notebook builds. The suffixes the shared modules load at import time come f
 `SIC_BOX_SUFFIX_LOW` / `_HIGH` / `_MID`, which §10 sets for you; the defaults are the older
 weight family and point at a cache this repository does not build.
 
-The anti-bistability requirement is not tested by a script here: it is a CONSTRAINT in
+The anti-bistability requirement is not tested by a script here: it is a training constraint in
 the high band's training objective (the global contraction bound, §8), and §11 of the
 notebook checks it on held-out data directly. A separate equilibrium sweep over an
 Arctic forcing climatology was used during development; it is left out of this
 repository because the climatology it consumed was not reproducible from anything
-here, and the global property is not established by a finite soft-penalty training run.
+here, and the notebook reports the measured behaviour of the soft constraint.
 
 
 ## The online component
@@ -231,7 +229,7 @@ is needed, but the angular baseline has to be fixed rather than grid-relative.
 
 ### Running it in SpeedyWeather
 
-The component is two source files, not a package. To use it you need a SpeedyWeather source
+The component consists of two source files. To use it you need a SpeedyWeather source
 checkout whose API it matches (it was written against 0.21.1-dev), with the two files in
 `SpeedyWeather/src/parameterizations/` and one line added to `SpeedyWeather/src/SpeedyWeather.jl`:
 
@@ -250,9 +248,7 @@ julia --project=/path/to/SpeedyWeather make_initial_sic.jl \
       --trunc 63 --start 1989-01-01 --processed processed --out /path/to/weights_dir
 ```
 
-Without that file nothing errors and nothing stops: every cell stays uninitialised and the
-first update cycle fills all three history slots with whatever concentration the atmosphere
-started from. The run proceeds from a cold start with a flat history in both hemispheres.
+The initial-state file supplies the four SIC history fields required for a reanalysis-initialised run. If the file is absent, the component starts from the atmospheric model's initial concentration and fills the history slots from that state, producing a flat-history cold start in both hemispheres.
 
 With the file and the exported weights:
 
