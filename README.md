@@ -1,6 +1,6 @@
 # Physics-Constrained Machine Learning for Sea-Ice Parameterisation
 
-**A regime-aware, distilled neural sea-ice closure for a GCM without prognostic ocean state.**
+**A mixture-of-experts, distilled, and physics-constrained neural sea-ice closure for a GCM without full prognostic ocean states.**
 
 This repository implements a sea-ice concentration (SIC) parameterisation in PyTorch and a two-file Julia interface for [SpeedyWeather.jl](https://github.com/SpeedyWeather/SpeedyWeather.jl). The deployed mid-SIC student contains **13,574 trainable parameters**. The central challenge is a physically underdetermined closure problem arising from the absence of essential ocean-state variables in the atmospheric GCM.
 
