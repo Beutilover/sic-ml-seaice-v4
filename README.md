@@ -147,7 +147,7 @@ The executed copy is the one to read. The plain one is the one to run.
    against ERA5, the field from above the pole at the summer minimum, where the error sits
    on the map, and the whole year as an mp4 (GIF if ffmpeg is missing). Ice reads white.
 9. **§15** — the single-step diagnostics as figures, drawn from the arrays §10-§11 already
-   built, so a figure cannot disagree with the table it came from.
+   built.
 
 Everything from §13 on displays inline and is written to `report_figures/`.
 
@@ -252,8 +252,7 @@ julia --project=/path/to/SpeedyWeather make_initial_sic.jl \
 
 Without that file nothing errors and nothing stops: every cell stays uninitialised and the
 first update cycle fills all three history slots with whatever concentration the atmosphere
-started from. The run proceeds from a cold start with a flat history, in both hemispheres,
-which is not the experiment the offline results describe.
+started from. The run proceeds from a cold start with a flat history in both hemispheres.
 
 With the file and the exported weights:
 
