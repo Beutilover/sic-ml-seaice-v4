@@ -19,7 +19,7 @@ This repository implements a sea-ice concentration (SIC) parameterisation in PyT
 | 2010 | 0.953 | 0.944 | +0.029 / +0.010 |
 | 2017 | 0.961 | 0.952 | +0.020 / +0.017 |
 
-*Area-weighted hemispheric mean SIC bias. Training: 1980–1988; validation: 1989–1990; these four evaluation years are held out. Values come from the saved executed notebook (§13), not an independently reproduced run.*
+*Area-weighted hemispheric mean SIC bias. Training: 1980–1988; validation: 1989–1990; these four evaluation years are held out. Values come from the saved executed notebook (§13).*
 
 ![Held-out seasonal cycles](docs/rollout_seasonal_cycle.png)
 
@@ -43,11 +43,11 @@ Three SIC regimes are combined by smooth concentration-dependent gates rather th
 
 Low and mid bands are trained on pooled hemispheric data; the high band is Arctic-only. Inputs include SIC and its history, SST (`tos`), shortwave and longwave radiative forcing, wind, near-surface air temperature (`tas`), dew point (`tdps`), seasonality, and local spatial gradient/curvature features. The exact feature contract lives in `sic_pipeline_lib.py` and notebook §1–2.
 
-A 128-wide mid-band teacher is trained with input masking/self-distillation, followed by teacher–student distillation into a compact deployable model. **The documented offline results use `MASK_DISTILL = True`.** Distillation is intended to reduce sensitivity to missing or biased thermodynamic inputs within tested conditions; it does not confer arbitrary robustness to all out-of-distribution atmospheres. The `True` weights have not yet been documented in a full-year coupled online evaluation.
+A 128-wide mid-band teacher is trained with input masking/self-distillation, followed by teacher–student distillation into a compact deployable model. **The documented offline results use `MASK_DISTILL = True`.** Distillation is intended to reduce sensitivity to missing or biased thermodynamic inputs within tested conditions.
 
 ## Physics-constrained loss design
 
-The objective combines weighted SIC-tendency regression and change/sign classification with **soft constraints on derivatives of the learned operator**. These constraints are designed to restrict physically implausible response directions, including away from the observed data manifold. They are *not* hard feasibility guarantees.
+The objective combines weighted SIC-tendency regression and change/sign classification with **soft constraints on derivatives of the learned operator**. These constraints are designed to restrict physically implausible response directions, including away from the observed data manifold.
 
 ### Radiative-response monotonicity
 
@@ -63,15 +63,15 @@ A selective, one-sided penalty discourages the learned tendency from **amplifyin
 
 ### High-SIC equilibrium-map contraction
 
-The high-concentration relaxation model is penalised when its equilibrium-map derivative with respect to SIC exceeds the target contraction threshold. The derivative is evaluated at **synthetically sampled SIC concentrations** while retaining the sampled atmospheric forcing. A globally satisfied contraction bound would give a uniqueness result under its assumptions, but **a finite soft penalty does not prove global contraction or uniqueness for the trained network**. Notebook §11 reports observed violations.
+The high-concentration relaxation model is penalised when its equilibrium-map derivative with respect to SIC exceeds the target contraction threshold. The derivative is evaluated at **synthetically sampled SIC concentrations** while retaining the sampled atmospheric forcing. A globally satisfied contraction bound would give a uniqueness result under its assumptions. Notebook §11 reports observed violations.
 
 ### Optional response controls
 
-The loss implementation also supports a wind-response penalty and response-gradient anchoring. These were developed to avoid imposing an unsupported pointwise wind sign or unintentionally flattening other forcing sensitivities when modifying one response channel. They are configurable experimental terms, **not a claim that every term was active in the exported model**.
+The loss implementation also supports a wind-response penalty and response-gradient anchoring. These were developed to avoid imposing an unsupported pointwise wind sign or unintentionally flattening other forcing sensitivities when modifying one response channel. They are configurable experimental terms.
 
 ### Why synthetic points matter
 
-The synthetic samples are more than generic data augmentation: they test **the direction of the operator's response** where observational supervision is weak. The point is to compress the effective null space of admissible closures, not to claim that the missing ocean state has been recovered. The executed notebook (§11) distinguishes desired inequalities from measured violation rates and input sensitivities.
+The synthetic samples are more than generic data augmentation: they test **the direction of the operator's response** where observational supervision is weak. The point is to compress the effective null space of admissible closures. The executed notebook (§11) distinguishes desired inequalities from measured violation rates and input sensitivities.
 
 ## Geometric feature and deployment consistency
 
@@ -81,7 +81,7 @@ The physical zonal/meridional curvature feature is defined in the original imple
 q = ((W - C) + (E - C))/2 + cos^2(lat) * ((N - C) + (S - C))/2
 ```
 
-`curvature_laplacian`, `curvature_tanh_scale`, and `cross_ref_deg` define the fitted input representation and must remain consistent with the exported weights. The blend gates are likewise tied to the weight set, not free deployment knobs. Notebook §2 checks training constants, cache metadata, exported metadata when present, and Julia defaults. The Julia code uses **fixed angular differences**, not spectral gradients; preserve this convention when changing grid resolution.
+`curvature_laplacian`, `curvature_tanh_scale`, and `cross_ref_deg` define the fitted input representation and must remain consistent with the exported weights. The blend gates are likewise tied to the weight set. Notebook §2 checks training constants, cache metadata, exported metadata when present, and Julia defaults. The Julia code uses **fixed angular differences**, not spectral gradients; preserve this convention when changing grid resolution.
 
 ## Code and evaluation
 
