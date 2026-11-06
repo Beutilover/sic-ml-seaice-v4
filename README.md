@@ -2,13 +2,13 @@
 
 **A regime-aware, distilled neural sea-ice closure for a GCM without prognostic ocean state.**
 
-This repository implements a sea-ice concentration (SIC) parameterisation in PyTorch and a two-file Julia interface for [SpeedyWeather.jl](https://github.com/SpeedyWeather/SpeedyWeather.jl). The deployed mid-SIC student contains **13,574 trainable parameters**. The emphasis is on a difficult *physical closure* problem, not on proposing a novel neural-network primitive.
+This repository implements a sea-ice concentration (SIC) parameterisation in PyTorch and a two-file Julia interface for [SpeedyWeather.jl](https://github.com/SpeedyWeather/SpeedyWeather.jl). The deployed mid-SIC student contains **13,574 trainable parameters**. The emphasis is on a difficult *physical closure* problem, due to the lack of a complete set of ocean-side variables in the atmospheric GCM.
 
 ![Arctic, one-year offline rollout](docs/rollout_2017_north.gif)
 
 ![Antarctic, one-year offline rollout](docs/rollout_2017_south.gif)
 
-*Held-out 2017, 1° grid. Left: ERA5 reference; centre: predicted SIC; right: error. Starting from 31 December 2016, the predicted SIC is fed back for an entire year. Atmospheric forcing remains prescribed from ERA5: this is a **closed-loop offline SIC rollout**, not a freely coupled climate simulation.*
+*Held-out 2017, 1° grid. Left: ERA5 reference; centre: predicted SIC; right: error. Starting from 31 December 2016, the predicted SIC is fed back for an entire year. Atmospheric forcing remains prescribed from ERA5: this is a **closed-loop offline SIC rollout**.*
 
 ## Results at a glance
 
