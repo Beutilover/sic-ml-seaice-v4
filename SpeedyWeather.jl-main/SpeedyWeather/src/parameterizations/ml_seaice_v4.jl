@@ -1,76 +1,195 @@
 """
-Gradient-based sea-ice concentration (SIC) parameterisation
-for coupled atmospheric model integration.
+Gradient-basis-cross candidate ML sea-ice model (2026-08-26), added ALONGSIDE `MLSeaIce` (V1),
+`MLSeaIceV2`, and `MLSeaIceV3` -- purely additive, does not modify, call into, or share any
+weights/state with any of them. All four can be defined in the same SpeedyWeather session; only one
+is ever attached to a given `PrimitiveWetModel` at a time via the `ocean` component slot.
 
-Implements regime-specific neural SIC tendency prediction using
-ChangeGateClassifier and RelaxationMoEClassifier architectures,
-with smooth blending between low-, mid-, and high-SIC regimes.
+Differs from `MLSeaIceV3` in exactly one way, driven by the underlying PyTorch work documented in
+`hemisphere_unified_gradbasis_mono_variants.ipynb`: the two cross-neighbor input columns hold a
+clean centered-difference gradient per axis, `[(N-S)/2, (W-E)/2]`, instead of V3's 4 raw redundant
+`[N,S,W,E]` columns (N/S and W/E are each highly anti-correlated in the real data, r=-0.6 to -0.89 --
+mostly two opposite-signed views of the same local gradient; V3's plain-4-column model was found to
+under-use the real, data-supported N-S dominance). This was tested because V3's online output showed
+a near-pole radial "spoke" streaking artifact; feeding the clean gradient directly (rather than
+asking the network to discover it from the redundant raw columns) substantially reduced it in
+offline rollout diagnostics: south (`d_dt=0`, no diffusion) rollout CORR 0.7386->0.9333, mean local
+SIC anomaly 0.0926->0.0240; north (`d_dt=0`) CORR 0.9171->0.9670, anomaly 0.0154->0.0039. Two
+earlier hypotheses (dropping N/S entirely; rescaling the raw E/W difference by the true spherical
+1/cos(lat) factor) were tried first and both made the streaking WORSE -- see the notebook for the
+full comparison table.
 
-Spatial features
-----------------
-Local spatial information is represented by centered-difference
-cross-neighbor gradients:
+Blend-gate boundaries were independently re-swept for this representation (TRAIN-only two-stage
+sweep, `d_dt=0` fixed throughout -- diffusion has NOT yet been swept for this variant, see below):
+south `lowsic_gate_center_south=0.02`, `width=0.025` (V3 used center 0.05).
+Two mono-penalty formulations (joint/sum vs separate) were compared at their own best-swept gate and
+came out essentially tied on pure offline rollout metrics (CORR/RMSE/anomaly deltas all
+<=0.0035/<=0.0007). Separate (`relu(grad_rsds)^2 + relu(grad_rld)^2`, guaranteeing
+d(pred)/d(rsds)<=0 AND d(pred)/d(rld)<=0 individually) was adopted over joint/sum once online
+radiation-COMPOSITION sensitivity became relevant, not just magnitude: since rsds/rld are fed as two
+separate raw columns (not a pre-combined `radsum`), the model's response depends on the short/long
+split, and SpeedyWeather's own online radiation has a real composition bias (2026-08-27 finding:
+JJA >=60N rsds overestimated ~+150-190 W/m^2, rld underestimated ~-70-90 W/m^2, roughly similar raw
+sum). A jointly-constrained model only guarantees the SUM's gradient is non-positive and could in
+principle have a wrong-signed individual response to one flux compensated by the other; separate
+constraints rule that out for both fluxes unconditionally -- the more defensible default now that
+composition, not just magnitude, is known to matter for this online coupling.
 
-    grad_ns = (N - S) / 2
-    grad_we = (W - E) / 2
+**2026-09-14 update, "radiation-composition-robust" retrain (now the default weights)**: the
+separate-penalty model above still under-melts online in both hemispheres' summers, traced to the
+real ERA5 training distribution rarely/never covering the online GCM's own biased
+`(rsds, rld)` composition (the same 2026-08-27 bias above). Retrained
+(`run_gradbasis_cross_sep_radrobust.py`) with one added loss term: the same separate gradient-sign
+mono-penalty, ALSO evaluated at randomly perturbed synthetic `(rsds, rld)` points
+(`SYNTH_PERTURB_STD=1.5` training-std, Gaussian, independent per flux), not just real training points
+-- a label-free constraint (a sign penalty needs no target value), so this adds no fabricated
+supervision, only a wider domain over which the existing constraint is enforced. A synthetic-
+composition sensitivity check confirmed the mechanism: evaluated at the online-biased point, the
+mid-band model's shift effect on predicted tendency flips sign (plain: +0.00034, more growth/less
+melt, reproducing the online bug's direction; radrobust: -0.00023, more melt, corrected). Online
+(T63/15L, 3yr, no diffusion; this first check used the pre-2026-09-15 gate/timestep, isolating the
+weight change alone, see the Gate paragraph below for what changed after) confirms a
+melt-season-specific deepening of the summer SIC minimum in both hemispheres with winter maxima
+essentially unchanged and no streaking regression. See `hemisphere_unified_gradbasis_radrobust_v4.
+ipynb` for the full record (training log, offline VAL comparison, sensitivity check, held-out VAL
+effect-verification, online comparison figure). Weights: `checkpoints_hemisphere_unified_rld_tdps/
+{unified_low,unified_mid,north_high}_gradbasis_cross_sep_radrobust`, exported via
+`export_v4_radrobust_weights.py`. The plain (non-synthetic-constrained) separate-penalty weights
+remain on disk (`ml_seaice_weights_v4_unified_{low,mid}`, `ml_seaice_weights_v4_north_high`) but are
+no longer this struct's default.
 
-These features provide compact directional information without
-requiring separate raw values for all four neighboring cells.
+**Gate: a fresh TRAIN-only sweep for this checkpoint picked a different North gate
+(`highsic_gate_center` 0.9->0.85, both North widths 0.05->0.025), now ADOPTED below, but only
+together with a REQUIRED timestep change -- this is worth recording in detail, both the false start
+and the resolution, because it is a real methodology gap, not just a routine gate update.** The swept
+gate looked mildly WORSE on TRAIN/VAL single-step and held-out rollout metrics (CORR deltas <=0.005)
+but was assumed adoptable since offline rollout showed no red flags. A first online 3yr T63 attempt
+with that gate at the DEFAULT timestep (2026-09-14) diverged to NaN partway through year 2 (around
+1990-09, the Arctic autumn refreeze onset), while the SAME weights with the OLD North gate ran 3 full
+years clean at the same default timestep. Root-caused (not just observed, 2026-09-15): the SIC field
+itself diverges measurably between the two gate configurations from month 1 (>60% of Arctic points
+differing by more than 0.15 SIC by June of year 2), but this divergence alone does not explain the
+NaN -- the gate's own sigmoid blend is unconditionally NaN-safe for any finite input and width, and
+the dedicated high-SIC sub-model extrapolates smoothly, with no blowup, from its trained range
+[0.9,1.0] down to 0.5. The actual trigger, found by checking the coupled atmosphere's own vorticity
+field (not just surface temperature) at increasing time resolution: a fast, top-model-layer,
+high-Southern-latitude numerical instability with NO visible precursor at daily or even 3-hourly
+resolution, consistent with a classic CFL-type explicit-scheme failure. Quantitatively: this
+component's online scripts use `Grid=FullGaussianGrid` (equal longitude-point count at every
+latitude ring, required so the neighbor-gradient cross feature above has an EXACT neighbor at every
+point, not a reduced-grid nearest-longitude approximation), whose zonal grid spacing shrinks with
+`cos(latitude)`; combined with `PrimitiveWetModel`'s fixed, non-adaptive `Leapfrog` timestep (no CFL
+logic anywhere in SpeedyWeather), the zonal Courant number at just the ALREADY-observed ~100 m/s
+background wind speed is ~1.0 at 55 degrees latitude and rises above 1 at every higher latitude --
+this whole online configuration runs with almost no CFL margin at high latitudes, independent of
+which sea-ice gate is active; the new gate's compounding SIC drift merely perturbed the coupled
+system enough, during the fastest-changing part of the seasonal cycle, to cross a threshold that was
+already thin. **Confirmed directly**: re-running the identical new-gate checkpoint with the
+atmospheric timestep HALVED (`Δt_at_T31=Minute(20)`, giving `Δt=600s` at T63 instead of the default
+`1200s`) completed a full, clean 3-year run (2026-09-15), including the previously-fatal window, with
+no other change. **The new gate is therefore adopted below, on the explicit condition that any
+`PrimitiveWetModel` using it online must also be constructed with a halved timestep** (see
+`weights_dir_mid`'s docstring and every gate field below for the exact kwarg) -- this is NOT
+something `MLSeaIceV4` itself can enforce (the timestep is a `PrimitiveWetModel`-level
+`time_stepping` setting, orthogonal to this component), so it must be set explicitly by whoever
+constructs the model. Running this gate at the default timestep reproduces the NaN.
 
-Model inputs
-------------
-Raw atmospheric and sea-ice inputs:
+**2026-09-22: North gate REVERTED to `(lowsic 0.05, highsic 0.9, both widths 0.05)`, halved-timestep
+requirement dropped pending online validation.** The TRAIN-only sweep that picked `0.85/0.025` above was
+run with a high-band checkpoint that predated a val-target normalization fix in `make_loaders` (val
+targets had been normalized with the val cache's own stats while callers un-normalized with train's,
+distorting best-epoch selection; only the Arctic-only high band went through that code path). The
+high band was retrained with the fix (best epoch 4 -> 7, VAL CORR 0.38328 -> 0.41420) and its exported
+weights replaced in place. Re-running the same sweep with it picks `(0.05, 0.9, 0.05)` (Stage 2 CORR
+0.97098 vs 0.96974 for `0.85/0.025`); pre-fix, `0.85/0.025` had won by a noise-level 0.00005.
+**Validated online (2026-09-22)**: these defaults (fixed high band, gate `0.05/0.9/0.05`, DEFAULT
+timestep 1200s, T63/15L FullGaussianGrid, no diffusion) ran 3 years with no NaN
+(`run_3yr_t63_15layer_ml_v4radrobust_fixedhigh_oldgate_defaultdt_netcdf.jl`), so the halved-timestep
+requirement no longer applies to the defaults. Against the previous default (0.85/0.025 at 600s):
+land-masked zonal second difference south 0.00538 vs 0.00646 (cleanest of all runs compared), north
+0.00611 vs 0.00541 with an unchanged grid-scale (k=61-96) power share (5.67% vs 5.63%) and no radial
+spokes visible in the monthly maps; year-2 -> year-3 mean-SIC change north +0.043 vs +0.046, south
++0.009 vs +0.033. The `0.85/0.025` gate itself is unchanged in character: if selected again
+explicitly, it still needs the halved timestep described above.
 
-    [siconc, tos, rsds, rld, sfcwind, tas]
+**2026-09-24: North gate changed to `(lowsic 0.08/0.07, highsic 0.83/0.11)`, the previous
+`(0.05/0.05, 0.9/0.05)` is now the old default.** The 2026-09-22 sweep that produced the old values
+tried only a handful of hand-picked combinations and tied the two North widths together. A full
+coordinate search with the widths separated (`gate_sweep_full_v4.py`, then `gate_sweep_extended_v4.py`)
+found a much better but degenerate optimum -- `(0.17/0.09, 0.70/0.2875)` blends all three sub-models
+across nearly the whole SIC range, i.e. an ensemble average rather than the band decomposition this
+model is built on, so it was rejected. Re-running the search under an explicit separation constraint
+(mid keeps >= 0.95 of the weight at SIC 0.5, high >= 0.8 at SIC 1.0, low >= 0.7 at SIC 0.0,
+`gate_sweep_banded_v4.py`) gives the gate adopted here; it hands low 0.002 and high 0.047 at SIC 0.5,
+so the bands stay separate.
 
-followed by the two spatial gradients and an optional dew-point
-temperature (tdps) feature.
+Offline (TRAIN-only objective, two 4-year free rollouts, unsmoothed inputs, adopted weights):
+CORR 0.96551 / RMSE 0.09923 / mean yearly-min error +0.0589, against 0.95943 / 0.10759 / +0.0685 for
+the old gate. Single held-out VAL check (1989-1990): 0.96423 / 0.10134 / +0.0460 against
+0.95623 / 0.11155 / +0.0523.
 
-The low- and mid-SIC models include tdps, while the high-SIC
-model uses the reduced feature set.
+Online (3yr T63/15L, default timestep, no diffusion,
+`run_3yr_t63_15layer_ml_v4radrobust_bandedgate_netcdf.jl`): no NaN, and on the criteria that decide an
+online run it is a wash rather than a gain -- grid-scale (k=61-96) power share 5.73% north / 2.42%
+south against the old gate's 5.67% / 2.45%, i.e. no new grid-scale artefact; land-masked zonal second
+difference 0.00719 north (old 0.00611) and 0.00589 south (old 0.00538); year-2 -> year-3 mean SIC
++0.056 north / +0.015 south against +0.043 / +0.009. Adopted on the offline gain, with the online
+behaviour unchanged within the spread already seen between runs (user decision, 2026-09-24).
 
-Physical-response regularisation
---------------------------------
-The exported neural models are trained with physically motivated
-loss penalties, including radiative-response monotonicity.
+**2026-09-24, second change: the UNSMOOTHED-TRAINED weights and their own gate become the default.**
+Weights `ml_seaice_weights_v4_nosmooth_*` (trained on `cache_rld_ablation_nosmooth`, spatial_sigma=0,
+matching the raw per-point values this component actually feeds online), North gate
+`(lowsic 0.24/0.085, highsic 0.65/0.01)`. The previous adopted weights and their gate
+`(0.08/0.07, 0.83/0.11)` remain on disk as `ml_seaice_weights_v4_radrobust_*`.
 
-Separate shortwave and longwave response penalties are evaluated
-at observed and synthetically perturbed forcing states to improve
-robustness to changes in radiation composition.
+The gate had to be re-swept for these weights, and that is the point: the gate decides how the three
+sub-models are blended, so it is model-dependent. Optimised for the adopted weights the same
+band-separated search gives `(0.08/0.07, 0.83/0.11)`; optimised for these it gives
+`(0.24/0.085, 0.65/0.01)` -- a far lower, much steeper high-SIC boundary. Earlier online tests of these
+weights used the adopted weights' gate and looked bad because of it.
 
-These are training-time soft constraints, not exact guarantees
-on the deployed neural operator.
+Offline (free rollout, ERA5 forcing, unsmoothed inputs): held-out VAL 1989-1990 north CORR 0.97103 /
+RMSE 0.09042 against 0.96423 / 0.10134 for the adopted weights at their own gate; TRAIN objective
+0.97226 / 0.08824 against 0.96551 / 0.09923. South rollout CORR 0.944 against 0.909.
 
-Regime blending
----------------
-The three models are combined through smooth SIC-dependent gates.
-Gate parameters are calibrated for the corresponding checkpoint
-set and should remain consistent with the exported weights.
+Online (3yr T63/15L, default timestep, no diffusion,
+`run_3yr_t63_v4_forcingdump.jl nosmooth nsgate`): no NaN -- the steep high gate (width 0.01) raised a
+CFL concern, since 0.025 once forced a halved timestep, but it ran clean at 1200s. Arctic summer melt
+is the closest to observations of any online run here: ocean-masked >=60N minimum 0.4840 against
+ERA5's 0.3014, where the adopted weights give 0.4965 at their own gate and 0.5000 at the older one, and
+these same weights gave 0.6114 when run with the adopted weights' gate. Year-2 -> year-3 mean SIC
++0.036 north / +0.028 south, comparable to the other runs.
 
-Online evaluation
------------------
-The component evaluates SIC tendencies using atmospheric forcing,
-local SIC history, and spatial features constructed from the
-host model state.
+On the Antarctic zonal roughness, which earlier rounds treated as this weight set's disqualifying
+defect: it is ~2x the adopted runs', but measuring ERA5 itself through the identical metric on the
+identical T63 grid (`era5_zonal_roughness_on_t63.py`) shows BOTH are far too smooth -- south, all
+SIC >= 0.02, ERA5 0.0446 against 0.0102 here and 0.0059 for the adopted weights; per bin ERA5 runs
+6-12x the adopted weights and 3-6x these. "Smoother" was never the right objective; against
+observations these weights are the closer of the two. (That the roughness is closer in MAGNITUDE does
+not establish that it is in the right places -- a date-matched spatial comparison has not been done.)
 
-The default configuration uses checkpoints trained with
-unsmoothed spatial inputs, consistent with the per-grid-point
-features supplied during online integration.
+**Diffusion has deliberately NOT been swept for this variant** (unlike V3, whose
+`diffusion_coefficient`/`diffusion_coefficient_south` are genuine TRAIN-window-swept, adopted
+values) -- the gate sweep above was run entirely with diffusion OFF to isolate and evaluate the
+per-pixel model+gate behavior on its own merits first (matching the offline spoke-diagnostic
+methodology). `apply_spectral_diffusion`/`apply_spectral_diffusion_south` therefore default to
+`false` here; the coefficient fields are kept (for a future sweep) but are not meaningful defaults
+and must not be read as "adopted" values the way V3's are.
 
-Optional spectral diffusion is available but disabled by default.
-Its coefficients are not treated as calibrated parameters for
-the default checkpoint configuration.
-
-The implementation supports coupled evaluation in SpeedyWeather
-using the model's prescribed update cadence and forcing
-conventions.
-
+Update cadence, running-mean forcing convention, `rld`-only (no `Rlu`) longwave accumulation,
+shifted-notos TOS lag, SST floor at Arctic/Antarctic ML-branch points, and the spectral
+(unconditionally-stable) diffusion pass mechanism are all identical to `MLSeaIceV3` -- see that
+file's docstring for the underlying rationale, not re-derived here. `dewpoint_from_humidity`
+(Magnus-Tetens dewpoint from lowest-level specific humidity) is reused directly from
+`ml_seaice_v2.jl` rather than redefined here -- it is a stateless physics helper with no
+version-specific dependencies.
 """
 
 include("ml_seaice_model_v4.jl")
 using .MLSeaIceModelV4: MLWeightsV4, MLWeightsChangeGateV4
 using .MLSeaIceModelV4: load_ml_weights_v4, load_ml_weights_changegate_v4
-using .MLSeaIceModelV4: ml_forward_v4, ml_normalize_features_v4, ml_forward_changegate_with_prob
+using .MLSeaIceModelV4: ml_forward_v4, ml_normalize_features_v4, ml_forward_changegate_with_prob,
+    flatten_weights_v4, ml_forward_flat_v4, ml_forward_flat_changegate_v4, ml_normalize_flat_v4!,
+    MLWeightsFlatV4CPU, MLWeightsFlatChangeGateV4CPU
 
 export MLSeaIceV4
 
@@ -436,6 +555,61 @@ export MLSeaIceV4
     weights_mid::Union{Nothing, MLWeightsV4} = nothing
     weights_highsic::Union{Nothing, MLWeightsV4} = nothing
     weights_lowsic::Union{Nothing, MLWeightsChangeGateV4} = nothing
+
+    """[OPTION] Run the three bands through the allocation-free flat forward pass
+    (`ml_forward_flat_v4`) instead of the clarity-first one. Same arithmetic, different storage:
+    the backbone's H->H layers become one (H, H, 3) array, single-output heads become vectors,
+    and the per-point working vectors become columns of preallocated scratch -- which is what
+    makes the sweep expressible as a kernel. Measured on 20000 inputs across the full coupled
+    envelope: allocations 5456 -> 0 bytes per point per band, 1.25x faster on the CPU, and
+    max|original - flat| of 3.9e-7 (mid), 8.3e-7 (high), 8.6e-7 (low) -- NOT bit-identical,
+    because `W' * h` goes through BLAS gemv whose blocked reduction order no scalar loop
+    reproduces. Default false."""
+    flat_forward::Bool = false
+
+    # flat weights, built from the loaded ones in initialize! when flat_forward is on
+    flat_mid::Union{Nothing, MLWeightsFlatV4CPU} = nothing
+    flat_highsic::Union{Nothing, MLWeightsFlatV4CPU} = nothing
+    flat_lowsic::Union{Nothing, MLWeightsFlatChangeGateV4CPU} = nothing
+    """[OPTION] Number of scratch SLOTS the flat pass has. One slot per concurrent worker, not
+    per grid point: a serial sweep needs exactly one and should use it, because a column per
+    point scatters the working vectors over megabytes and costs more in cache misses than the
+    allocation it saves (measured: the 5-day update went 0.10 -> 0.14 s per 6-day chunk when
+    indexed by point). A kernel sets this to npoints so every thread owns a column; a threaded
+    CPU sweep would set it to the thread count. 0 means npoints."""
+    flat_nslots::Int = 1
+
+    # scratch: (width, flat_nslots). One column per concurrent worker.
+    flat_x_mid::Matrix{Float32} = zeros(Float32, 0, 0)
+    flat_x_high::Matrix{Float32} = zeros(Float32, 0, 0)
+    flat_x_low::Matrix{Float32} = zeros(Float32, 0, 0)
+    flat_h1::Matrix{Float32} = zeros(Float32, 0, 0)
+    flat_h2::Matrix{Float32} = zeros(Float32, 0, 0)
+    flat_mb::Matrix{Float32} = zeros(Float32, 0, 0)
+
+    """[OPTION] Run the 5-day update as KernelAbstractions kernels instead of the serial sweep, so
+    it can execute on a GPU. Requires `flat_forward` (the kernels take each band's weights as ONE
+    struct argument, which is the only way the launches fit inside Metal's ~29-argument budget) and
+    `cross_from_snapshot` (without it the sweep's result depends on the visiting order, so no
+    parallel form of it exists -- see ml_seaice_v4_kernels.jl). Both are asserted, not switched on
+    silently. Measured at T63 size on Metal: 4.0x the serial path, with the CPU kernel path
+    bit-identical to it."""
+    kernel_sweep::Bool = false
+
+    """[OPTION] Architecture the kernel sweep runs on, when it should NOT be the model's. The
+    realistic configuration is exactly that: the model on the CPU and this component on the GPU,
+    because the spectral transform is 45-260x SLOWER on Metal while this component is 4x faster, so
+    moving the whole model would lose far more than the component gains. `nothing` means the
+    model's own architecture. Only the sea-ice field, the sea surface temperature and the six cycle
+    means cross the bus, once per 5-day update."""
+    kernel_architecture::Any = nothing
+
+    """Device buffers for `kernel_sweep`, built in `initialize!`. Typed `Any` deliberately: the
+    element type is the device's array type, which differs per backend, and a type parameter on
+    this struct collided with `@kwdef`. It is only ever read once per 5-day update, immediately
+    passed into `ml_seaice_sweep_kernels!`, so the single dynamic dispatch is free and nothing
+    inside the barrier is untyped."""
+    kernel_buffers::Any = nothing
     is_arctic::Vector{Bool} = zeros(Bool, 0)
     is_antarctic::Vector{Bool} = zeros(Bool, 0)
     east_idx::Vector{Int} = zeros(Int, 0)
@@ -470,10 +644,137 @@ export MLSeaIceV4
     sic_hist3::Vector{Float64} = zeros(0)
     initialized::Vector{Bool} = zeros(Bool, 0)
 
+    """[OPTION] Precision the 5-day update is carried out in ON THE DEVICE, 64 or 32. Set by the
+    generator from what the device actually supports (probed, see
+    `architecture_supports_float64`): 64 on the CPU and CUDA, 32 only where there is no double
+    precision at all, and then only because it was asked for -- requesting 64 on such a device
+    is an error, not a silent downgrade.
+
+    [2026-11-11] This option does NOT change the HOST accumulators, and an earlier version of
+    this docstring wrongly said it did. The accumulator fields above are declared
+    `Vector{Float64}`, so `setproperty!` converts anything assigned to them back to Float64 and
+    `zeros(Float32, npoints)` silently became a Float64 array -- measured, not inferred. Nothing
+    needs them narrowed: the per-timestep accumulation is host work either way, and the kernel
+    sweep converts to Float32 once per 5-day cycle when it copies them to the device. What the
+    option still does is refuse Float64 DEVICE arithmetic on a device that has none, which is
+    the assertion it was added for."""
+    accum_precision::Int = 64
+
+    """[OPTION] Build the cross (gradient / curvature) columns from a SNAPSHOT of the sea-ice
+    field taken before the 5-day update, instead of from the live array the same loop is
+    writing into.
+
+    The update loop assigns `ℵ[ij] = sic_next` and reads `ℵ[nidx]` for the neighbours in the
+    same pass, so with `ij` ascending the WEST neighbour (ij-1, same ring) and the NORTH one
+    (ring j-1, lower indices) are already updated while EAST (ij+1) and SOUTH (ring j+1) are
+    not. The gradient columns `(W-E)/2`, `(N-S)/2` and the curvature are therefore formed from
+    a mix of post- and pre-update values, with a fixed sign per axis, while the offline training
+    cache builds all of them from one consistent snapshot. The contamination is of the order of
+    the update increment itself, which in the smooth pack interior is the same size as the
+    feature -- and it is directional, so it is a candidate mechanism for the streak artifacts.
+
+    Turning this on also makes the sweep a Jacobi update, i.e. order-independent, which is what
+    allows the loop to be threaded at all. Default false, so every existing run reproduces
+    bit-for-bit."""
+    cross_from_snapshot::Bool = false
+
+    """[OPTION] Print, for each of the first `cross_snapshot_report` updates, how large the
+    sequential-sweep contamination of the cross columns actually is: the RMS of
+    (live-array column - snapshot column) against the RMS of the column itself, per column and
+    per hemisphere. Costs a second pass over the ice points on those updates only."""
+    cross_snapshot_report::Int = 0
+
+    # snapshot buffer, allocated in initialize! only when cross_from_snapshot or the report is on
+    sic_snapshot::Vector{Float32} = zeros(Float32, 0)
+
     last_update::Base.RefValue{DateTime} = Ref(DEFAULT_DATE)
 end
 
-MLSeaIceV4(::SpectralGrid; kwargs...) = MLSeaIceV4(; kwargs...)
+"""$(TYPEDSIGNATURES)
+Does this architecture actually support Float64? Probed, not inferred from the backend's name:
+allocate a Float64 array on the device and do one operation on it. CPU and CUDA pass; Metal has
+no double precision at all and throws. The result is cached per architecture type, so the probe
+runs once per session.
+
+The component accumulates 720 timesteps of radiation and temperature per 5-day cycle, which is
+why the accumulators are Float64 wherever that is available: a naive Float32 sum of 720 terms of
+order 300 W/m2 carries a rounding walk of ~0.2 in a total of ~216000, i.e. ~3e-4 W/m2 in the
+cycle mean. That is small but it is NOT zero, so the precision is a declared option that is
+asserted against the device rather than silently chosen."""
+function architecture_supports_float64(arch)
+    get!(_F64_SUPPORT, typeof(arch)) do
+        try
+            # NOT on_architecture: that SILENTLY DOWNCASTS a Float64 array to the device's
+            # precision (measured: on_architecture(GPU(), ones(Float64,4)) returns an
+            # MtlVector{Float32}), so it reports success on a device with no double precision at
+            # all. Build the device array type at Float64 and force a broadcast, which is what
+            # actually has to compile.
+            AT = Architectures.array_type(arch)
+            a = AT{Float64}(undef, 4)
+            fill!(a, 1.0)
+            b = a .* 2.0
+            isfinite(Float64(first(Array(b))))
+        catch
+            false
+        end
+    end
+end
+const _F64_SUPPORT = Dict{Any, Bool}()
+
+"""$(TYPEDSIGNATURES)
+The element type the 5-day cycle is accumulated in. Float64 unless the device cannot do it, in
+which case the generator has already asserted that Float32 was asked for explicitly."""
+accumulator_type(sea_ice_model::MLSeaIceV4) =
+    sea_ice_model.accum_precision == 32 ? Float32 : Float64
+
+"""$(TYPEDSIGNATURES)
+Generator. The accumulator precision is chosen from what the architecture actually supports and
+ASSERTED, never silently downgraded: pass `accum_precision = 64` and it errors on a device
+without double precision instead of quietly switching to Float32 and changing every cycle mean.
+Left unset, it takes Float64 where the device has it (CPU, CUDA) and Float32 where it does not
+(Metal), and says so."""
+function MLSeaIceV4(SG::SpectralGrid; accum_precision = nothing, kwargs...)
+    # the device the SWEEP will run on, which is the component's own architecture when it has one
+    # (model on the CPU, component on the GPU) and the model's otherwise
+    arch = get(kwargs, :kernel_architecture, nothing)
+    arch = arch === nothing ? SG.architecture : arch
+    has_f64 = architecture_supports_float64(arch)
+    A = if accum_precision === nothing
+        has_f64 ? Float64 : Float32
+    elseif accum_precision == 64
+        has_f64 || error("MLSeaIceV4: accum_precision = 64 was requested but $(typeof(arch)) " *
+                         "has no Float64 (probed by allocating one on the device). Metal is the usual " *
+                         "case; CUDA and the CPU both support it. Pass accum_precision = 32 to accept " *
+                         "Float32 accumulation of the 720-step cycle (~3e-4 W/m2 in the cycle mean), " *
+                         "or run this on a device that has double precision.")
+        Float64
+    elseif accum_precision == 32
+        Float32
+    else
+        error("MLSeaIceV4: accum_precision must be 32, 64 or nothing, got $(accum_precision)")
+    end
+    accum_precision === nothing && !has_f64 &&
+        @info "MLSeaIceV4: $(typeof(arch)) has no Float64; the kernel sweep will run in Float32"
+
+    # [2026-11-11] FOLLOW THE MODEL. When the model itself is running on a GPU, the serial sweep
+    # and the per-timestep accumulation loop both index the model's fields one element at a time,
+    # which on device arrays is scalar indexing -- CUDA.jl refuses it outright, so the component
+    # does not merely run slowly there, it does not run at all. The kernel path is therefore the
+    # DEFAULT whenever the model is on a GPU, together with the two options it requires, and the
+    # user does not have to know any of this to run a parallel model. Nothing changes for a host
+    # model: there the defaults stay exactly as they were, so every existing run is untouched.
+    extra = NamedTuple()
+    if SG.architecture isa Architectures.GPU && !haskey(kwargs, :kernel_sweep)
+        extra = (;
+            kernel_sweep = true,
+            flat_forward = get(kwargs, :flat_forward, true),
+            cross_from_snapshot = get(kwargs, :cross_from_snapshot, true),
+        )
+        @info "MLSeaIceV4: the model is on $(typeof(SG.architecture)), so the component follows it " *
+              "-- kernel_sweep on, with flat_forward and cross_from_snapshot, which it requires"
+    end
+    return MLSeaIceV4(; accum_precision = (A === Float64 ? 64 : 32), kwargs..., extra...)
+end
 
 
 # Training-set tos ceiling as a function of SIC, derived from the TRAIN years 1980-1988 of
@@ -570,9 +871,15 @@ function initialize!(vars::Variables, sea_ice_model::MLSeaIceV4, model::Primitiv
     londs, latds = RingGrids.get_londlatds(grid)
 
     (; land_fraction) = model.land_sea_mask
-    is_arctic = [(latds[ij] >= sea_ice_model.lat_limit) && (land_fraction[ij] < 1) for ij in 1:npoints]
+    # [2026-11-11] `.data` and an explicit Array(): on a GPU model land_fraction is a Field over a
+    # device array and these comprehensions index it point by point, which CUDA.jl refuses. Going
+    # through the underlying array makes this one device-to-host copy instead of npoints of them --
+    # `Array(::Field)` would fall back to the generic, scalar path. Everything initialize! builds
+    # below is a host-side table, so the host copy is the right representation to work from.
+    lf_host = Array(land_fraction.data)
+    is_arctic = [(latds[ij] >= sea_ice_model.lat_limit) && (lf_host[ij] < 1) for ij in 1:npoints]
     is_antarctic = sea_ice_model.enable_south ?
-        [(latds[ij] <= -sea_ice_model.lat_limit_south) && (land_fraction[ij] < 1) for ij in 1:npoints] :
+        [(latds[ij] <= -sea_ice_model.lat_limit_south) && (lf_host[ij] < 1) for ij in 1:npoints] :
         zeros(Bool, npoints)
 
     rings = grid.rings
@@ -654,35 +961,75 @@ function initialize!(vars::Variables, sea_ice_model::MLSeaIceV4, model::Primitiv
     sea_ice_model.north2_idx = north2_idx
     sea_ice_model.south2_idx = south2_idx
     sea_ice_model.coslat2 = Float32[max(cosd(latds[ij]), 1f-3)^2 for ij in 1:npoints]
+    if sea_ice_model.cross_from_snapshot || sea_ice_model.cross_snapshot_report > 0
+        sea_ice_model.sic_snapshot = zeros(Float32, npoints)
+    end
 
-    sea_ice_model.accum_rsds = zeros(npoints)
-    sea_ice_model.accum_lw = zeros(npoints)
-    sea_ice_model.accum_wind = zeros(npoints)
-    sea_ice_model.accum_tas = zeros(npoints)
-    sea_ice_model.accum_tos = zeros(npoints)
-    sea_ice_model.accum_tdps = zeros(npoints)
+    if sea_ice_model.flat_forward
+        fm = flatten_weights_v4(sea_ice_model.weights_mid)
+        fh = flatten_weights_v4(sea_ice_model.weights_highsic)
+        fl = flatten_weights_v4(sea_ice_model.weights_lowsic)
+        # the three bands share the backbone width and the momentum width, which is what lets one
+        # h1/h2/mb scratch serve all of them; assert it rather than assume it
+        (fm.H == fh.H == fl.H) ||
+            error("MLSeaIceV4: flat_forward needs one backbone width across bands, got " *
+                  "mid $(fm.H), high $(fh.H), low $(fl.H)")
+        (fm.Mm == fh.Mm == fl.Mm) ||
+            error("MLSeaIceV4: flat_forward needs one momentum width across bands, got " *
+                  "mid $(fm.Mm), high $(fh.Mm), low $(fl.Mm)")
+        sea_ice_model.flat_mid = fm
+        sea_ice_model.flat_highsic = fh
+        sea_ice_model.flat_lowsic = fl
+        nslots = sea_ice_model.flat_nslots <= 0 ? npoints : sea_ice_model.flat_nslots
+        sea_ice_model.flat_x_mid = zeros(Float32, fm.nin, nslots)
+        sea_ice_model.flat_x_high = zeros(Float32, fh.nin, nslots)
+        sea_ice_model.flat_x_low = zeros(Float32, fl.nin, nslots)
+        sea_ice_model.flat_h1 = zeros(Float32, fm.H, nslots)
+        sea_ice_model.flat_h2 = zeros(Float32, fm.H, nslots)
+        sea_ice_model.flat_mb = zeros(Float32, fm.Mm, nslots)
+        @info "MLSeaIceV4: flat_forward on (nin mid/high/low = $(fm.nin)/$(fh.nin)/$(fl.nin), " *
+              "H = $(fm.H), Mm = $(fm.Mm), $(nslots) slot(s), scratch " *
+              "$(round((fm.nin + fh.nin + fl.nin + 2fm.H + fm.Mm) * nslots * 4 / 2^20, digits=3)) MB)"
+    end
+
+    # [2026-11-11] The accumulator FIELDS are declared Vector{Float64}, so these assignments are
+    # Float64 whatever A is -- see the note on accum_precision. A is kept only for the NaN fills
+    # below, where it is equally Float64, and the option's real job is the device-side assertion.
+    A = accumulator_type(sea_ice_model)
+    sea_ice_model.accum_rsds = zeros(A, npoints)
+    sea_ice_model.accum_lw = zeros(A, npoints)
+    sea_ice_model.accum_wind = zeros(A, npoints)
+    sea_ice_model.accum_tas = zeros(A, npoints)
+    sea_ice_model.accum_tos = zeros(A, npoints)
+    sea_ice_model.accum_tdps = zeros(A, npoints)
     sea_ice_model.accum_count = 0
 
-    sea_ice_model.tos_prev_mean = fill(NaN, npoints)
-    sea_ice_model.sic_hist1 = fill(NaN, npoints)
-    sea_ice_model.sic_hist2 = fill(NaN, npoints)
-    sea_ice_model.sic_hist3 = fill(NaN, npoints)
+    sea_ice_model.tos_prev_mean = fill(A(NaN), npoints)
+    sea_ice_model.sic_hist1 = fill(A(NaN), npoints)
+    sea_ice_model.sic_hist2 = fill(A(NaN), npoints)
+    sea_ice_model.sic_hist3 = fill(A(NaN), npoints)
     sea_ice_model.initialized = zeros(Bool, npoints)
     sea_ice_model.last_update[] = vars.prognostic.clock.time
+
+    # [2026-11-11] The two blocks below write the concentration field and read the SST field point
+    # by point. Staged through the underlying arrays for the same reason as the masks above, written
+    # on the host, and pushed back once at the end. On the CPU this is two copies of npoints floats,
+    # paid once per run; it is NOT inside any loop.
+    sic_host = Array(ℵ.data)
+    sst_host = Array(vars.prognostic.ocean.sea_surface_temperature.data)
 
     if !isempty(sea_ice_model.initial_sic_path) && isfile(sea_ice_model.initial_sic_path)
         raw = reinterpret(Float32, read(sea_ice_model.initial_sic_path))
         length(raw) == 4 * npoints || error("initial_sic.bin has $(length(raw)) values, expected $(4 * npoints)")
         hist3 = raw[1:npoints]; hist2 = raw[npoints+1:2npoints]
         hist1 = raw[2npoints+1:3npoints]; current = raw[3npoints+1:4npoints]
-        sst0 = vars.prognostic.ocean.sea_surface_temperature
         for ij in 1:npoints
             if is_arctic[ij]
-                ℵ[ij] = clamp(current[ij], 0f0, 1f0)
+                sic_host[ij] = clamp(current[ij], 0f0, 1f0)
                 sea_ice_model.sic_hist3[ij] = clamp(hist3[ij], 0f0, 1f0)
                 sea_ice_model.sic_hist2[ij] = clamp(hist2[ij], 0f0, 1f0)
                 sea_ice_model.sic_hist1[ij] = clamp(hist1[ij], 0f0, 1f0)
-                sea_ice_model.tos_prev_mean[ij] = isfinite(sst0[ij]) ? Float64(sst0[ij]) : sea_ice_model.temp_freeze
+                sea_ice_model.tos_prev_mean[ij] = isfinite(sst_host[ij]) ? Float64(sst_host[ij]) : sea_ice_model.temp_freeze
                 sea_ice_model.initialized[ij] = true
             end
         end
@@ -693,23 +1040,74 @@ function initialize!(vars::Variables, sea_ice_model::MLSeaIceV4, model::Primitiv
         length(raw_s) == 4 * npoints || error("initial_sic_south.bin has $(length(raw_s)) values, expected $(4 * npoints)")
         hist3_s = raw_s[1:npoints]; hist2_s = raw_s[npoints+1:2npoints]
         hist1_s = raw_s[2npoints+1:3npoints]; current_s = raw_s[3npoints+1:4npoints]
-        sst0 = vars.prognostic.ocean.sea_surface_temperature
         for ij in 1:npoints
             if is_antarctic[ij]
-                ℵ[ij] = clamp(current_s[ij], 0f0, 1f0)
+                sic_host[ij] = clamp(current_s[ij], 0f0, 1f0)
                 sea_ice_model.sic_hist3[ij] = clamp(hist3_s[ij], 0f0, 1f0)
                 sea_ice_model.sic_hist2[ij] = clamp(hist2_s[ij], 0f0, 1f0)
                 sea_ice_model.sic_hist1[ij] = clamp(hist1_s[ij], 0f0, 1f0)
-                sea_ice_model.tos_prev_mean[ij] = isfinite(sst0[ij]) ? Float64(sst0[ij]) : sea_ice_model.temp_freeze
+                sea_ice_model.tos_prev_mean[ij] = isfinite(sst_host[ij]) ? Float64(sst_host[ij]) : sea_ice_model.temp_freeze
                 sea_ice_model.initialized[ij] = true
             end
         end
     end
 
+    # push the staged concentration back, once, after BOTH blocks have had their say. They touch
+    # disjoint points (arctic vs antarctic) so the order between them does not matter, but the
+    # field itself must end up holding what the host copy says.
+    copyto!(ℵ.data, sic_host)
+
+    # LAST: the device buffers copy the component's persistent state onto the device, and that
+    # state is only final here -- the two initial_sic blocks above fill the history, the previous
+    # tos and the initialised flags. Built any earlier (it was, briefly) the history arrays are
+    # still length zero and the first kernel launch writes out of bounds.
+    if sea_ice_model.kernel_sweep
+        sea_ice_model.flat_forward ||
+            error("MLSeaIceV4: kernel_sweep needs flat_forward = true -- the kernels pass each " *
+                  "band's weights as a single struct argument, which the clarity-first layout " *
+                  "cannot do inside Metal's ~29-argument limit.")
+        sea_ice_model.cross_from_snapshot ||
+            error("MLSeaIceV4: kernel_sweep needs cross_from_snapshot = true. Without it the sweep " *
+                  "reads the sea-ice field it is writing, so its result depends on the visiting " *
+                  "order and there is no parallel form of it to run -- the cross columns were " *
+                  "measured to be 32/75/90% sweep noise in that mode.")
+        sea_ice_model.cross_snapshot_report == 0 ||
+            error("MLSeaIceV4: cross_snapshot_report compares the live field against the snapshot, " *
+                  "which the kernel sweep never forms. Run the report on the serial path.")
+        # [2026-11-11] Both diffusion branches fill a weight and a filled field point by point and
+        # then transform them. There is no device form of that here, and on a GPU model the loops
+        # would be a scalar index of a device array, so say it at initialisation rather than let a
+        # run reach the first 5-day update and fail there. Neither option is on in any adopted run.
+        (!sea_ice_model.apply_spectral_diffusion && !sea_ice_model.apply_spectral_diffusion_south) ||
+            error("MLSeaIceV4: apply_spectral_diffusion is not available on the kernel path -- it " *
+                  "builds and indexes fields point by point. Run it on the serial path (CPU).")
+        field_arch = model.spectral_grid.architecture
+        arch = sea_ice_model.kernel_architecture === nothing ?
+            field_arch : sea_ice_model.kernel_architecture
+        sea_ice_model.kernel_buffers =
+            ml_seaice_kernel_buffers(sea_ice_model, arch, field_arch, npoints)
+        @info "MLSeaIceV4: kernel_sweep on ($(typeof(arch)), $(npoints) points, " *
+              "accum_precision = $(sea_ice_model.accum_precision), fields " *
+              "$(sea_ice_model.kernel_buffers.resident ? "resident (no transfer)" : "staged via the host"))"
+    elseif model.spectral_grid.architecture isa Architectures.GPU
+        error("MLSeaIceV4: the model is on $(typeof(model.spectral_grid.architecture)) but " *
+              "kernel_sweep is off. Both the 5-day sweep and the per-timestep accumulation index " *
+              "the model's fields element by element, which on device arrays is scalar indexing; " *
+              "CUDA.jl refuses it and nothing would run. Leave kernel_sweep unset and it is turned " *
+              "on for you, or pass kernel_architecture = CPU() to keep the component on the host.")
+    end
+
     return nothing
 end
 
+# [2026-11-11] where the component's time actually goes, split between the per-timestep
+# accumulation (every step, all ocean points) and the 5-day update (the forward passes). Plain
+# accumulators, never read by the physics, so they cannot change a result. ML_TIME[3] counts the
+# steps. Printed by the run script, which divides by its own chunk wall time.
+const ML_TIME = zeros(Float64, 3)
+
 function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveEquation)
+    _t_entry = time_ns()
     ℵ = vars.prognostic.ocean.sea_ice_concentration
     haskey(vars.prognostic.ocean, :sea_surface_temperature) || return nothing
     sst = vars.prognostic.ocean.sea_surface_temperature
@@ -733,31 +1131,54 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
     # makes -- reused directly here, not redefined).
     (; nlayers) = model.geometry
     have_humidity = haskey(vars.grid, :humidity)
+    A_ = accumulator_type(sea_ice_model)
 
-    @inbounds for ij in 1:npoints
+    # [2026-11-11] The loop below reads seven of the model's fields and writes one, one element at
+    # a time. That is fine on the host and impossible on a device, so when the fields live where
+    # the kernels run it is replaced by a launch over the same body. This is the path that matters
+    # for following a parallel model: it runs every timestep, where the sweep runs every 5 days.
+    B_acc = sea_ice_model.kernel_buffers
+    accum_on_device = sea_ice_model.kernel_sweep && B_acc !== nothing && B_acc.resident
+    if accum_on_device
+        # a dry model still has to hand the kernel SOMETHING of the right shape: the humidity read
+        # is dead code behind `have_humidity`, but it is 2-D indexing, so a 1-D stand-in would be a
+        # compile-time hazard on a device rather than a harmless unused argument
+        humid_field = have_humidity ?
+            get_prognostic_step(vars.grid.humidity, model.time_stepping, sea_ice_model) :
+            vars.grid.temperature
+        ml_seaice_accumulate_kernel!(
+            sea_ice_model, B_acc, sst, rsds, Rld, wind10, tas, land_fraction,
+            humid_field, pₛ_field, nlayers, have_humidity,
+        )
+    end
+
+    @inbounds for ij in (accum_on_device ? (1:0) : (1:npoints))
         if land_fraction[ij] < 1 && isfinite(sst[ij])
             if (is_arctic[ij] || is_antarctic[ij]) && sst[ij] < tos_floor
                 sst[ij] = tos_floor
             end
-            accum_rsds[ij] += Float64(rsds[ij])
-            accum_lw[ij] += Float64(Rld[ij])
-            accum_wind[ij] += Float64(wind10[ij])
-            accum_tas[ij] += Float64(tas[ij])
-            accum_tos[ij] += Float64(sst[ij])
+            accum_rsds[ij] += A_(rsds[ij])
+            accum_lw[ij] += A_(Rld[ij])
+            accum_wind[ij] += A_(wind10[ij])
+            accum_tas[ij] += A_(tas[ij])
+            accum_tos[ij] += A_(sst[ij])
             if have_humidity
                 q_ij = Float32(get_prognostic_step(vars.grid.humidity, model.time_stepping, sea_ice_model)[ij, nlayers])
                 td = dewpoint_from_humidity(max(q_ij, 0f0), Float32(pₛ_field[ij]))
-                accum_tdps[ij] += Float64(td)
+                accum_tdps[ij] += A_(td)
             end
         end
     end
     sea_ice_model.accum_count += 1
+    ML_TIME[1] += (time_ns() - _t_entry) * 1e-9
+    ML_TIME[3] += 1
 
     now = vars.prognostic.clock.time
     (now - sea_ice_model.last_update[]) < sea_ice_model.update_every && return nothing
+    _t_update = time_ns()
     sea_ice_model.last_update[] = now
 
-    n = Float64(sea_ice_model.accum_count)
+    n = A_(sea_ice_model.accum_count)
     w_mid = sea_ice_model.weights_mid
     w_high = sea_ice_model.weights_highsic
     w_low = sea_ice_model.weights_lowsic
@@ -790,9 +1211,51 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
     end
     n_cross_s = n_cross
     (; tos_prev_mean, sic_hist1, sic_hist2, sic_hist3, initialized) = sea_ice_model
+    flat_on = sea_ice_model.flat_forward
+    fw_mid = sea_ice_model.flat_mid; fw_high = sea_ice_model.flat_highsic; fw_low = sea_ice_model.flat_lowsic
+    fx_mid = sea_ice_model.flat_x_mid; fx_high = sea_ice_model.flat_x_high; fx_low = sea_ice_model.flat_x_low
+    fh1 = sea_ice_model.flat_h1; fh2 = sea_ice_model.flat_h2; fmb = sea_ice_model.flat_mb
+    # one slot while the sweep is serial; a kernel would pass ij here
+    flat_many = flat_on && size(fh1, 2) > 1
     Δt_days = Float32(Dates.value(Second(sea_ice_model.update_every)) / 86400)
 
-    for ij in 1:npoints
+    # The sweep below writes ℵ[ij] while reading ℵ[nidx] for the neighbours, so without a
+    # snapshot the cross columns see a mix of updated and not-yet-updated points (see
+    # cross_from_snapshot). Taken once per update, so the cost is one copy every 5 days.
+    snap_on = sea_ice_model.cross_from_snapshot || sea_ice_model.cross_snapshot_report > 0
+    sic_snap = sea_ice_model.sic_snapshot
+    # [2026-11-11] Skipped on the kernel path. seaice_prep_kernel! takes the snapshot itself, on the
+    # device, so this host copy is redundant there -- and it is a point-by-point read of the sea-ice
+    # field, which CUDA.jl refuses on a GPU model. Nothing below reads sic_snap when it is skipped:
+    # the serial loop is an empty range and the report block needs cross_snapshot_report > 0, which
+    # kernel_sweep rejects outright (see the preconditions in initialize!).
+    if snap_on && !sea_ice_model.kernel_sweep
+        @inbounds for ij in 1:npoints
+            sic_snap[ij] = Float32(ℵ[ij])
+        end
+    end
+    # when the option is off the field read for neighbours stays the live array, bit-for-bit
+    cross_snap = sea_ice_model.cross_from_snapshot
+    # report accumulators: sum of squares of (live - snapshot) and of the snapshot column itself,
+    # per cross column, north then south
+    rep_on = sea_ice_model.cross_snapshot_report > 0
+    rep_d = zeros(Float64, 3, 2)
+    rep_c = zeros(Float64, 3, 2)
+    rep_n = zeros(Int, 2)
+
+    # The kernel sweep replaces the loop below wholesale. Written as an empty range rather than an
+    # if/else around 290 lines so the serial path stays textually untouched and keeps reproducing
+    # earlier runs bit-for-bit.
+    kernel_done = false
+    if sea_ice_model.kernel_sweep
+        ml_seaice_sweep_kernels!(
+            sea_ice_model, sea_ice_model.kernel_buffers, ℵ, sst, land_fraction, n, have_humidity,
+            Δt_days * 86400,
+        )
+        kernel_done = true
+    end
+
+    for ij in (kernel_done ? (1:0) : (1:npoints))
         if is_arctic[ij] && isfinite(sst[ij])
             sic_now = Float32(ℵ[ij])
             rsds_mean = Float32(accum_rsds[ij] / n)
@@ -810,7 +1273,7 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
 
             @inline function neighbor_diff(nidx::Int)
                 (nidx == 0 || land_fraction[nidx] >= 1) && return 0f0
-                return Float32(ℵ[nidx] - sic_now)
+                return cross_snap ? (sic_snap[nidx] - sic_now) : Float32(ℵ[nidx] - sic_now)
             end
             # gradient-basis cross: [(N-S)/2, (W-E)/2] -- a clean centered-difference gradient per
             # axis, matching build_cache_v2.py's gradient_basis_cross option / cross_diff_2d_gradbasis
@@ -854,11 +1317,41 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
             elseif n_cross >= 3
                 @inline function neighbor_val(nidx::Int)
                     (nidx == 0 || land_fraction[nidx] >= 1) && return sic_now
-                    return Float32(ℵ[nidx])
+                    return cross_snap ? sic_snap[nidx] : Float32(ℵ[nidx])
                 end
                 q4 = (neighbor_val(west2_idx[ij]) - 4f0 * neighbor_val(west_idx[ij]) + 6f0 * sic_now
                       - 4f0 * neighbor_val(east_idx[ij]) + neighbor_val(east2_idx[ij])) / 16f0
                 cross2 = (cross2[1], cross2[2], q4)
+            end
+
+            if rep_on
+                @inline function nd_live(nidx::Int)
+                    (nidx == 0 || land_fraction[nidx] >= 1) && return 0f0
+                    return Float32(ℵ[nidx] - sic_now)
+                end
+                @inline function nd_snap(nidx::Int)
+                    (nidx == 0 || land_fraction[nidx] >= 1) && return 0f0
+                    return sic_snap[nidx] - sic_now
+                end
+                nl = nd_live(north_idx[ij]); sl = nd_live(south_idx[ij])
+                wl = nd_live(west_idx[ij]);  el = nd_live(east_idx[ij])
+                ns = nd_snap(north_idx[ij]); ss = nd_snap(south_idx[ij])
+                ws = nd_snap(west_idx[ij]);  es = nd_snap(east_idx[ij])
+                cvl = (wl + el) / 2f0; cvs = (ws + es) / 2f0
+                if curv_lap_on
+                    cvl += coslat2[ij] * (nl + sl) / 2f0
+                    cvs += coslat2[ij] * (ns + ss) / 2f0
+                end
+                if curv_tanh_on
+                    cvl = tanh(cvl / curv_tanh_scale); cvs = tanh(cvs / curv_tanh_scale)
+                end
+                live = (cross_scale_ns * (nl - sl) / 2f0, cross_scale_we * (wl - el) / 2f0, cvl)
+                snap = (cross_scale_ns * (ns - ss) / 2f0, cross_scale_we * (ws - es) / 2f0, cvs)
+                for c in 1:3
+                    rep_d[c, 1] += (live[c] - snap[c])^2
+                    rep_c[c, 1] += snap[c]^2
+                end
+                rep_n[1] += 1
             end
 
             hist3 = (Float32(sic_hist3[ij]), Float32(sic_hist2[ij]), Float32(sic_hist1[ij]))
@@ -867,14 +1360,27 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
             if tos_ceil_on
                 tos_in = min(tos_in, tos_ceiling(sic_now, true))
             end
-            x_mid = ml_normalize_features_v4(w_mid, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2[1:length(w_mid.cross_mean)])
-            tendency_mid = ml_forward_v4(w_mid, x_mid, sic_now, hist3)
+            c1 = cross2[1]; c2 = cross2[2]
+            c3 = length(cross2) >= 3 ? cross2[3] : 0f0
+            local tendency_mid::Float32, tendency_high::Float32, tendency_low::Float32, p_change::Float32
+            if flat_on
+                slot = flat_many ? ij : 1
+                ml_normalize_flat_v4!(fx_mid, slot, fw_mid, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, c1, c2, c3)
+                tendency_mid = ml_forward_flat_v4(fw_mid, fx_mid, fh1, fh2, fmb, slot, sic_now, hist3)
+                ml_normalize_flat_v4!(fx_high, slot, fw_high, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, c1, c2, c3)
+                tendency_high = ml_forward_flat_v4(fw_high, fx_high, fh1, fh2, fmb, slot, sic_now, hist3)
+                ml_normalize_flat_v4!(fx_low, slot, fw_low, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, c1, c2, c3)
+                tendency_low, p_change = ml_forward_flat_changegate_v4(fw_low, fx_low, fh1, fh2, fmb, slot, sic_now, hist3)
+            else
+                x_mid = ml_normalize_features_v4(w_mid, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2[1:length(w_mid.cross_mean)])
+                tendency_mid = ml_forward_v4(w_mid, x_mid, sic_now, hist3)
 
-            x_high = ml_normalize_features_v4(w_high, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2[1:length(w_high.cross_mean)])
-            tendency_high = ml_forward_v4(w_high, x_high, sic_now, hist3)
+                x_high = ml_normalize_features_v4(w_high, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2[1:length(w_high.cross_mean)])
+                tendency_high = ml_forward_v4(w_high, x_high, sic_now, hist3)
 
-            x_low = ml_normalize_features_v4(w_low, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2[1:length(w_low.cross_mean)])
-            tendency_low, p_change = ml_forward_changegate_with_prob(w_low, x_low, sic_now, hist3)
+                x_low = ml_normalize_features_v4(w_low, sic_now, tos_in, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2[1:length(w_low.cross_mean)])
+                tendency_low, p_change = ml_forward_changegate_with_prob(w_low, x_low, sic_now, hist3)
+            end
 
             gate_high = 1f0 / (1f0 + exp(-(sic_now - gate_center) / gate_width))
             gate_low = 1f0 / (1f0 + exp(-(low_gate_center - sic_now) / low_gate_width))
@@ -906,7 +1412,7 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
 
             @inline function neighbor_diff_s(nidx::Int)
                 (nidx == 0 || land_fraction[nidx] >= 1) && return 0f0
-                return Float32(ℵ[nidx] - sic_now)
+                return cross_snap ? (sic_snap[nidx] - sic_now) : Float32(ℵ[nidx] - sic_now)
             end
             n_d_s = neighbor_diff_s(north_idx[ij]); s_d_s = neighbor_diff_s(south_idx[ij])
             w_d_s = neighbor_diff_s(west_idx[ij]); e_d_s = neighbor_diff_s(east_idx[ij])
@@ -929,7 +1435,7 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
             elseif n_cross_s >= 3
                 @inline function neighbor_val_s(nidx::Int)
                     (nidx == 0 || land_fraction[nidx] >= 1) && return sic_now
-                    return Float32(ℵ[nidx])
+                    return cross_snap ? sic_snap[nidx] : Float32(ℵ[nidx])
                 end
                 q4_s = (neighbor_val_s(west2_idx[ij]) - 4f0 * neighbor_val_s(west_idx[ij]) + 6f0 * sic_now
                         - 4f0 * neighbor_val_s(east_idx[ij]) + neighbor_val_s(east2_idx[ij])) / 16f0
@@ -943,11 +1449,22 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
             if tos_ceil_on
                 tos_in_s = min(tos_in_s, tos_ceiling(sic_now, false))
             end
-            x_mid_s = ml_normalize_features_v4(w_mid, sic_now, tos_in_s, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2_s[1:length(w_mid.cross_mean)])
-            tendency_mid_s = ml_forward_v4(w_mid, x_mid_s, sic_now, hist3)
+            c1s = cross2_s[1]; c2s = cross2_s[2]
+            c3s = length(cross2_s) >= 3 ? cross2_s[3] : 0f0
+            local tendency_mid_s::Float32, tendency_low_s::Float32, p_change_s::Float32
+            if flat_on
+                slot = flat_many ? ij : 1
+                ml_normalize_flat_v4!(fx_mid, slot, fw_mid, sic_now, tos_in_s, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, c1s, c2s, c3s)
+                tendency_mid_s = ml_forward_flat_v4(fw_mid, fx_mid, fh1, fh2, fmb, slot, sic_now, hist3)
+                ml_normalize_flat_v4!(fx_low, slot, fw_low, sic_now, tos_in_s, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, c1s, c2s, c3s)
+                tendency_low_s, p_change_s = ml_forward_flat_changegate_v4(fw_low, fx_low, fh1, fh2, fmb, slot, sic_now, hist3)
+            else
+                x_mid_s = ml_normalize_features_v4(w_mid, sic_now, tos_in_s, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2_s[1:length(w_mid.cross_mean)])
+                tendency_mid_s = ml_forward_v4(w_mid, x_mid_s, sic_now, hist3)
 
-            x_low_s = ml_normalize_features_v4(w_low, sic_now, tos_in_s, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2_s[1:length(w_low.cross_mean)])
-            tendency_low_s, p_change_s = ml_forward_changegate_with_prob(w_low, x_low_s, sic_now, hist3)
+                x_low_s = ml_normalize_features_v4(w_low, sic_now, tos_in_s, rsds_mean, lw_mean, wind_mean, tas_mean, tdps_mean, cross2_s[1:length(w_low.cross_mean)])
+                tendency_low_s, p_change_s = ml_forward_changegate_with_prob(w_low, x_low_s, sic_now, hist3)
+            end
 
             gate_low_s = 1f0 / (1f0 + exp(-(low_gate_center_south - sic_now) / low_gate_width_south))
             gate_mid_s = 1f0 - gate_low_s
@@ -1044,9 +1561,26 @@ function timestep!(vars::Variables, sea_ice_model::MLSeaIceV4, model::PrimitiveE
         end
     end
 
+    if rep_on && rep_n[1] > 0
+        np_ = rep_n[1]
+        @info "MLSeaIceV4 cross-column sequential-sweep contamination, Arctic, $(np_) ice points, " *
+              "update $(now): " *
+              join(["col$(c) RMS(live-snap)=$(round(sqrt(rep_d[c, 1] / np_), sigdigits=4)) " *
+                    "RMS(col)=$(round(sqrt(rep_c[c, 1] / np_), sigdigits=4)) " *
+                    "ratio=$(round(sqrt(rep_d[c, 1] / max(rep_c[c, 1], 1e-30)), sigdigits=4))"
+                    for c in 1:3], " | ")
+        sea_ice_model.cross_snapshot_report -= 1
+    end
+
     fill!(accum_rsds, 0.0); fill!(accum_lw, 0.0); fill!(accum_wind, 0.0)
     fill!(accum_tas, 0.0); fill!(accum_tos, 0.0); fill!(accum_tdps, 0.0)
+    # and the device copies, when they are the ones being accumulated into
+    if sea_ice_model.kernel_sweep && sea_ice_model.kernel_buffers !== nothing &&
+            sea_ice_model.kernel_buffers.resident
+        ml_seaice_reset_device_accumulators!(sea_ice_model.kernel_buffers)
+    end
     sea_ice_model.accum_count = 0
+    ML_TIME[2] += (time_ns() - _t_update) * 1e-9
 
     return nothing
 end
