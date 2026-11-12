@@ -268,8 +268,66 @@ run!(simulation, period=Day(30))
 One file serves both hemispheres: the blocks are global fields and the component masks each to
 its own domain.
 
+
 ### GCM integration
 
-The learned sea-ice parameterisation is integrated into SpeedyWeather.jl and supports T31, T63, and T127 configurations. The repository includes the Julia implementation, model-weight export pipeline, and instructions for running coupled simulations.
+The learned sea-ice parameterisation is integrated into [SpeedyWeather.jl](https://github.com/SpeedyWeather/SpeedyWeather.jl), supporting T31, T63, and T127 configurations on both CPU and GPU architectures. The implementation automatically follows the architecture of the surrounding model, selecting either the original serial update or a GPU-compatible parallel sweep. Model fields remain resident on the GPU throughout the sea-ice update, avoiding unnecessary host–device transfers.
 
-The current `MASK_DISTILL=True` configuration is evaluated through the offline experiments presented above. Additional year-long coupled results will be included when available.
+The repository includes the Julia implementation, model-weight export pipeline, GPU compatibility patches, and dedicated numerical verification tests.
+
+#### GPU acceleration
+
+GPU execution is enabled directly through SpeedyWeather's architecture interface:
+
+```julia
+spectral_grid = SpectralGrid(
+    trunc=127,
+    nlayers=15,
+    Grid=FullGaussianGrid,
+    architecture=SpeedyWeather.GPU()
+)
+
+sea_ice = MLSeaIceV4(spectral_grid; ...)
+```
+
+Benchmarks were performed on a single NVIDIA L40 GPU at T127 resolution over 12 simulated days (3,457 time steps), comparing CPU and GPU execution of the same model configuration.
+
+| Performance metric | CPU | GPU | Speedup |
+|---|---:|---:|---:|
+| Full GCM wall-clock time | 2,500 s | 164 s | **15.2×** |
+| Sea-ice update per step | 1.67 ms | 0.30 ms | **5.6×** |
+
+The GPU implementation preserves the acceleration of the full coupled model while incorporating the learned sea-ice parameterisation. Performance benefits increase with resolution; at T63, GPU kernel-launch overhead can outweigh the computational savings of the parallel sea-ice update itself.
+
+A **three-year coupled T127 simulation** has completed successfully.
+
+#### Numerical verification
+
+The implementation includes dedicated tests for numerical consistency and long-term integration:
+
+- **Serial/parallel consistency:** Bit-for-bit agreement between serial and parallel sweeps on CPU.
+- **CPU/GPU agreement:** At T31, the maximum absolute difference is `5.4e-7`, with 4,317 of 4,608 grid points matching exactly.
+- **Long-term stability:** Successful three-year coupled integration at T127.
+- **Reproducibility:** GPU run-to-run variability has been independently isolated to the underlying SpeedyWeather/CUDA execution path using tests without the sea-ice component. CPU execution provides a deterministic regression reference.
+
+#### Implementation and compatibility
+
+The GPU integration includes targeted compatibility patches to SpeedyWeather and SpeedyTransforms, addressing implicit `Float64` promotion in `Float32` calculations. An additional cloud parameterisation option, `cloud_top_from_maximum` (default `false`), restores the original SPEEDY convention of selecting cloud cover and cloud-top height from the same moistest eligible layer.
+
+The implementation has been validated with **Julia 1.12.7** and supports single-GPU execution. Independent simulations can be distributed across multiple devices using separate processes and `CUDA_VISIBLE_DEVICES`.
+
+GPU integrations currently run without checkpointing. Within the ML sea-ice component, `apply_spectral_diffusion` is supported on the serial path; enabling it with the GPU parallel sweep raises an explicit initialisation error.
+
+#### Verification tests
+
+```bash
+# Serial/parallel numerical consistency
+julia --project=SpeedyWeather SpeedyWeather/test/parameterizations/ml_seaice_v4_kernel_sweep.jl
+
+# GPU execution and numerical verification
+julia --project=SpeedyWeather SpeedyWeather/test/GPU/ml_seaice_v4_kernel.jl
+```
+
+The CPU test verifies bit-for-bit agreement between the serial and parallel implementations, independently of stored reference values.
+
+
