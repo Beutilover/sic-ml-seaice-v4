@@ -660,23 +660,23 @@ export MLSeaIceV4
     the assertion it was added for."""
     accum_precision::Int = 64
 
-    """[OPTION] Build the cross (gradient / curvature) columns from a SNAPSHOT of the sea-ice
-    field taken before the 5-day update, instead of from the live array the same loop is
-    writing into.
+    """Build the cross (gradient / curvature) columns from a SNAPSHOT of the sea-ice field taken
+    before the 5-day update, instead of from the live array the same loop is writing into.
 
-    The update loop assigns `ℵ[ij] = sic_next` and reads `ℵ[nidx]` for the neighbours in the
-    same pass, so with `ij` ascending the WEST neighbour (ij-1, same ring) and the NORTH one
-    (ring j-1, lower indices) are already updated while EAST (ij+1) and SOUTH (ring j+1) are
-    not. The gradient columns `(W-E)/2`, `(N-S)/2` and the curvature are therefore formed from
-    a mix of post- and pre-update values, with a fixed sign per axis, while the offline training
-    cache builds all of them from one consistent snapshot. The contamination is of the order of
-    the update increment itself, which in the smooth pack interior is the same size as the
-    feature -- and it is directional, so it is a candidate mechanism for the streak artifacts.
+    This is unconditional and `initialize!` REFUSES a model built without it, because it is not a
+    modelling option: with it off the sweep is wrong. The
+    update loop assigns `ℵ[ij] = sic_next` and reads `ℵ[nidx]` for the neighbours in the same
+    pass, so with `ij` ascending the WEST neighbour (ij-1, same ring) and the NORTH one (ring j-1,
+    lower indices) are already updated while EAST (ij+1) and SOUTH (ring j+1) are not. The gradient
+    columns `(W-E)/2`, `(N-S)/2` and the curvature are then formed from a mix of post- and
+    pre-update values, with a fixed sign per axis, while the offline training cache builds all of
+    them from one consistent snapshot -- so the component is fed a different operator than the one
+    its weights were fitted to, and the discrepancy is of the order of the feature itself.
 
-    Turning this on also makes the sweep a Jacobi update, i.e. order-independent, which is what
-    allows the loop to be threaded at all. Default false, so every existing run reproduces
-    bit-for-bit."""
-    cross_from_snapshot::Bool = false
+    The snapshot also makes the sweep a Jacobi update, i.e. order-independent, which is what allows
+    the loop to be threaded or run as kernels at all; the kernel and GPU paths have always required
+    it, so this change makes the serial path agree with them instead of diverging from them."""
+    cross_from_snapshot::Bool = true
 
     """[OPTION] Print, for each of the first `cross_snapshot_report` updates, how large the
     sequential-sweep contamination of the cross columns actually is: the RMS of
@@ -1061,16 +1061,18 @@ function initialize!(vars::Variables, sea_ice_model::MLSeaIceV4, model::Primitiv
     # state is only final here -- the two initial_sic blocks above fill the history, the previous
     # tos and the initialised flags. Built any earlier (it was, briefly) the history arrays are
     # still length zero and the first kernel launch writes out of bounds.
+    # The sequential sweep is refused for EVERY model, not only a parallel one: it builds the cross
+    # columns from the field it is writing, so the component would be fed an operator no weight set
+    # was fitted against -- measured at 32/75/90% sweep noise per column.
+    sea_ice_model.cross_from_snapshot ||
+        error("MLSeaIceV4: cross_from_snapshot = false is a sequential sweep that reads the " *
+              "sea-ice field it is writing, feeding the networks cross columns they were never " *
+              "fitted against. It is not supported.")
     if sea_ice_model.kernel_sweep
         sea_ice_model.flat_forward ||
             error("MLSeaIceV4: kernel_sweep needs flat_forward = true -- the kernels pass each " *
                   "band's weights as a single struct argument, which the clarity-first layout " *
                   "cannot do inside Metal's ~29-argument limit.")
-        sea_ice_model.cross_from_snapshot ||
-            error("MLSeaIceV4: kernel_sweep needs cross_from_snapshot = true. Without it the sweep " *
-                  "reads the sea-ice field it is writing, so its result depends on the visiting " *
-                  "order and there is no parallel form of it to run -- the cross columns were " *
-                  "measured to be 32/75/90% sweep noise in that mode.")
         sea_ice_model.cross_snapshot_report == 0 ||
             error("MLSeaIceV4: cross_snapshot_report compares the live field against the snapshot, " *
                   "which the kernel sweep never forms. Run the report on the serial path.")
