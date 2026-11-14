@@ -38,7 +38,10 @@ else
         # all three are refused rather than silently switched on, because each one is a statement
         # about what makes the parallel form legal or meaningful
         @test_throws ErrorException build_seaice_sim(kernel_sweep = true, cross_from_snapshot = true)
-        @test_throws ErrorException build_seaice_sim(kernel_sweep = true, flat_forward = true)
+        # [2026-11-13] cross_from_snapshot is now unconditional and refused when false for ANY
+        # model, parallel or not, so this asks for the sequential sweep explicitly and must fail.
+        @test_throws ErrorException build_seaice_sim(kernel_sweep = true, flat_forward = true,
+                                                    cross_from_snapshot = false)
         @test_throws ErrorException build_seaice_sim(kernel_sweep = true, flat_forward = true,
                                                     cross_from_snapshot = true,
                                                     cross_snapshot_report = 2)
