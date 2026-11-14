@@ -1,15 +1,16 @@
 """
-Shared library for the sea-ice concentration (SIC) parameterisation framework.
+Reconstructed, PERSISTENT (not scratchpad -- see project memory on why) shared library for the SIC
+tendency modeling project: model classes, feature builder, dataset chain, cache builder, and a
+plain (no-monotonicity) training loop, reconstructed verbatim from Modeltry21_spatial2deg_moe.ipynb
+(cache builder) and Modeltry22_3way_blend_laplacian_diffusion.ipynb (models/dataset/feature-builder)
+after the original scratchpad module (`doy_sin_ablation_local.py`) this session had been using was
+lost to scratchpad cleanup between turns. Verified against real production checkpoints/caches
+before being trusted for new work -- see verify_sic_pipeline_lib.py.
 
-Provides neural-network architectures, feature construction, dataset and preprocessing utilities, training-cache generation, and baseline training routines.
-
-Supports atmospheric and thermodynamic inputs, including downward longwave radiation (`rld`), with consistent feature ordering and normalisation across training and evaluation.
-
-The raw input layout is:
-
-`[sic, tos, rsds, rls, wind, tas, doy_sin, doy_cos, rld]`
-
-The module serves as the common implementation layer for SIC model training, evaluation, and deployment preparation.
+Extended (additively) with support for "rld" (downward-only longwave), appended as raw column 8
+(X_raw layout: [sic,tos,rsds,rls,wind,tas,doy_sin,doy_cos,rld]), matching the same "append as a new
+trailing column, own separate normalization stats" pattern already used for tdps earlier this
+project -- existing 8-column (no rld) caches/checkpoints are completely unaffected.
 """
 from pathlib import Path
 import random
@@ -527,9 +528,48 @@ class RelaxationMoEClassifier(nn.Module):
         tendency_inc = (sic_eq_inc - sic_raw) * (1.0 - decay_inc)
         tendency_dec = (sic_eq_dec - sic_raw) * (1.0 - decay_dec)
         tendency = p_inc * tendency_inc + p_dec * tendency_dec
-        sic_eq = p_inc * sic_eq_inc + p_dec * sic_eq_dec
-        tau = p_inc * tau_inc + p_dec * tau_dec
-        return tendency, sic_eq, tau, class_logits
+        # The tendency is the only mixed quantity, and no equilibrium or timescale may be mixed:
+        # the relaxation is not linear in (equilibrium, timescale), so a convex combination of the
+        # branch equilibria together with one of the branch timescales does not return `tendency`
+        # when substituted back, and is an equilibrium of nothing. The branch equilibria are the
+        # meaningful objects; the contraction bound is stated on the update map, see
+        # state_contraction_penalty. The two slots stay None so a caller wanting them fails loudly.
+        return tendency, None, None, class_logits
+
+
+def state_contraction_penalty(model, x, tos_raw, sic_col, sic_mean, sic_std, history_h,
+                              sweep_lo=0.05, sweep_hi=0.95, widen=None):
+    """The contraction bound on the five-day update map, stated exactly.
+
+    The update is T(c) = c + y(c) at fixed forcing, so an equilibrium is a fixed point of T and a
+    second stable state requires T to self-amplify somewhere, T'(c) > 1, which is y'(c) > 0. The
+    penalty is therefore mean(relu(dy/dc)^2) with no reference to any equilibrium at all.
+
+    The bound is deliberately on the tendency and not on an equilibrium. A mixture equilibrium
+    would have to be a convex combination of the branch equilibria, which reconstructs the tendency
+    only if the two branch rates coincide, so it is not an equilibrium of the map being bounded.
+    dy/dc needs no such assumption.
+
+    c is written into the normalised concentration column, into the raw concentration argument and
+    into every history slot at once, so one autograd pass returns the TOTAL derivative, including
+    the 1/std of the normalised column; holding the history at the steady value c makes the
+    momentum differences vanish, which is what the fixed-point calculation assumes.
+
+    Returns (penalty, violating_fraction). `widen` optionally maps the synthetic batch through a
+    sampling widener before the forward pass.
+    """
+    b = x.shape[0]
+    onehot = torch.zeros(x.shape[1], device=x.device)
+    onehot[sic_col] = 1.0
+    c = (sweep_lo + (sweep_hi - sweep_lo) * torch.rand(b, device=x.device)).requires_grad_(True)
+    cn = ((c - sic_mean) / sic_std).unsqueeze(-1)
+    xs = x.detach() * (1.0 - onehot) + cn * onehot
+    if widen is not None:
+        xs = widen(xs, b, x.device)
+    hist = c.unsqueeze(-1).expand(b, int(history_h))
+    tend, _, _, _ = model(xs, c, tos_raw, hist)
+    dy, = torch.autograd.grad(tend.sum(), c, create_graph=True)
+    return (torch.relu(dy) ** 2).mean(), float((dy > 0.0).float().mean().item())
 
 
 class ChangeGateClassifier(nn.Module):
