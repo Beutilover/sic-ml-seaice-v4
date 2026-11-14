@@ -41,9 +41,8 @@ import central_pack_rollout as C
 
 torch.set_grad_enabled(False)
 # The weight set, from the command line, then SIC_WSET, then the one this repository
-# builds. It used to default to a different family, so running this with no arguments
-# scored a model the notebook never produces.
-SETS = sys.argv[1:] or [_os.environ.get("SIC_WSET", "hw2curvtanh100lapmtasmd")] \
+# builds and ml_seaice_v4.jl ships.
+SETS = sys.argv[1:] or [_os.environ.get("SIC_WSET", "hw2curvtanh100lapmtas")] \
     if (_os := __import__("os")) else []
 
 # (year, seed year, label, is it the same distribution as training)

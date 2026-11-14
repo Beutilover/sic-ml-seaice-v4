@@ -98,25 +98,16 @@ SETS = {
                           "_hw2curvtanh100statemonog0.3_lap",
                           dict(gate_low_center=0.20, gate_width=0.035,
                                gate_high_center=0.65, gate_width_high=0.05)),
-    # [2026-11-04] the SHIPPED package. "hw2curvtanh100lap" above is the pre-mtas lap set and is
-    # NOT what ml_seaice_v4.jl points at; the shipped mid band carries the one-sided warming
-    # penalty at lambda 100 (ml_seaice_weights_v4_lapmtas_*). Registered so the battery can
-    # address the shipped configuration by name instead of defaulting to its predecessor.
+    # the SHIPPED package. "hw2curvtanh100lap" above is the pre-mtas lap set and is NOT what
+    # ml_seaice_v4.jl points at; the shipped mid band carries the one-sided warming penalty at
+    # lambda 100 and matches its teacher under masking over the teacher's own
+    # ("tas","tdps","rld"). The gate was swept on the TRAIN years and kept at these values: no
+    # better band-separated point exists.
     "hw2curvtanh100lapmtas": ("_hw2curvtanh100zeroprop_lap",
-                              "_hw2curvtanh100selfdist1_dist64_l1_mtas100_lap",
+                              "_hw2curvtanh100selfdist1_dist64_l1_mtas100_md_lap",
                               "_hw2curvtanh100statemonog0.3_lap",
                               dict(gate_low_center=0.20, gate_width=0.035,
                                    gate_high_center=0.65, gate_width_high=0.05)),
-    # [2026-11-04] CANDIDATE. Same as the shipped package except the mid band's student now also
-    # matches the teacher UNDER MASKING, over the teacher's own ("tas","tdps","rld"); that branch
-    # was unreachable in every earlier export because MASK_COLS was the empty tuple unless
-    # MASK_TOS was set. Gate re-swept on TRAIN years and kept at the shipped values (no better
-    # band-separated point exists: gate_md_north.log, gate_md_south.log).
-    "hw2curvtanh100lapmtasmd": ("_hw2curvtanh100zeroprop_lap",
-                                "_hw2curvtanh100selfdist1_dist64_l1_mtas100_md_lap",
-                                "_hw2curvtanh100statemonog0.3_lap",
-                                dict(gate_low_center=0.20, gate_width=0.035,
-                                     gate_high_center=0.65, gate_width_high=0.05)),
     "hw2curvtanh100dist48": ("_hw2curvtanh100zeroprop", "_hw2curvtanh100selfdist1_dist48_l1",
                              "_hw2curvtanh100statemonog0.3",
                              dict(gate_low_center=0.20, gate_width=0.035,
@@ -460,6 +451,13 @@ def main():
     for name in wanted:
         spec = SETS[name]
         lm, mid_s, hi, gate = (spec[0], spec[1], spec[2], spec[3]) if len(spec) == 4 else (spec[0], None, spec[1], spec[2])
+        # The cross builder belongs to the SET, not to the battery: a `_lap` package carries a
+        # three-column operator and the pre-lap sets carry two, so the array has to be built the
+        # way the set's own normalisation expects. cross_for reads that off the suffixes and sets
+        # CROSS_NEEDS_LAT itself; the pre-lap assignment above is left in place so every earlier
+        # battery stays reproducible.
+        if any(x is not None and x.endswith("_lap") for x in (lm, mid_s, hi)):
+            R.cross_diff_2d = cross_for(lm, mid_s, hi)
         try:
             models, norms = load(lm, hi, mid_s)
         except FileNotFoundError as e:
