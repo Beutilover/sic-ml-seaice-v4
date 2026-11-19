@@ -251,7 +251,17 @@ def build_rollout_inputs(sic_v, tos_v, rsds_v, rls_v, wind_v, tas_v, sin_v, cos_
         rld_mean=norm["rld_mean"], rld_std=norm["rld_std"], tdps_mean=norm["tdps_mean"], tdps_std=norm["tdps_std"],
     )
     cross_norm = (cross_v - norm["cross_mean"]) / norm["cross_std"]
-    return np.concatenate([X_norm, cross_norm], axis=1).astype(np.float32)
+    X = np.concatenate([X_norm, cross_norm], axis=1).astype(np.float32)
+    if norm.get("tos_form") == "indicator":
+        # the band was trained with the ocean temperature named as a subpopulation rather than
+        # standardised: the column is tanh of the excess over the fill value, NOT divided by the
+        # base std, and the above-fill bit is appended last, after the cross columns. The excess is
+        # formed from the RAW tos here, which is what the training side also does -- it overwrites
+        # the normalised column from the cache's own raw array.
+        e = tos_v.astype(np.float64) - norm["tos_centre"]
+        X[:, 1] = np.tanh(e / norm["tos_scale"]).astype(np.float32)
+        X = np.concatenate([X, (e > norm["tos_tol"]).astype(np.float32)[:, None]], axis=1)
+    return X
 
 
 def _model_forward(model, X, sic_v, tos_v, hist_v):

@@ -98,11 +98,17 @@ SETS = {
                           "_hw2curvtanh100statemonog0.3_lap",
                           dict(gate_low_center=0.20, gate_width=0.035,
                                gate_high_center=0.65, gate_width_high=0.05)),
-    # the SHIPPED package. "hw2curvtanh100lap" above is the pre-mtas lap set and is NOT what
-    # ml_seaice_v4.jl points at; the shipped mid band carries the one-sided warming penalty at
-    # lambda 100 and matches its teacher under masking over the teacher's own
-    # ("tas","tdps","rld"). The gate was swept on the TRAIN years and kept at these values: no
-    # better band-separated point exists.
+    # the SHIPPED package. The mid band is distilled, under the coherent-warming penalty, from a
+    # teacher that carries the same penalty, and matches that teacher under masking over its own
+    # ("tas","tdps","rld"). The high band carries the INDICATOR form of the ocean-temperature
+    # column, so its in_dim is one wider than every set above. The gate is this set's own, re-swept
+    # on the TRAIN years alone.
+    "wttos": ("_hw2curvtanh100zeroprop_lap",
+              "_hw2curvtanh100selfdist1_dist64_l1_wt100_mtas100_md_lap",
+              "_hw2curvtanh100statemonog0.3_tosindicator3_lap",
+              dict(gate_low_center=0.21, gate_width=0.02,
+                   gate_high_center=0.65, gate_width_high=0.05)),
+    # the package wttos replaced, kept so a result recorded against it can be reproduced
     "hw2curvtanh100lapmtas": ("_hw2curvtanh100zeroprop_lap",
                               "_hw2curvtanh100selfdist1_dist64_l1_mtas100_md_lap",
                               "_hw2curvtanh100statemonog0.3_lap",
@@ -415,8 +421,17 @@ def load(lowmid_suffix, high_suffix, mid_suffix=None):
         if ck_path.exists():
             _sd = torch.load(ck_path, map_location="cpu", weights_only=False)["model_state"]
             _w = int(_sd["backbone.0.weight"].shape[0])      # width from the checkpoint, not assumed
-        kw = dict(in_dim=tr.X.shape[1], hidden=_w, depth=4, tau_floor=L.TAU_FLOOR, dt=L.DT,
-                  history_h=tr.history_h, mom_hidden=16)
+        # The ocean-temperature column's form is part of the input contract, so it has to reach
+        # rollout_lib's feature builder the same way the normalisation statistics do, and it makes
+        # the band one input wider than its cache. The band that carries it says so in its
+        # checkpoint name, which is also what the exported package declares in tos_column.txt.
+        _tosind = "_tosindicator" in suffix
+        _nrm_tos = {}
+        if _tosind:
+            _s = float(suffix.split("_tosindicator", 1)[1].split("_", 1)[0])
+            _nrm_tos = dict(tos_form="indicator", tos_centre=271.46, tos_scale=_s, tos_tol=1e-3)
+        kw = dict(in_dim=tr.X.shape[1] + (1 if _tosind else 0), hidden=_w, depth=4,
+                  tau_floor=L.TAU_FLOOR, dt=L.DT, history_h=tr.history_h, mom_hidden=16)
         m = (cls(**kw) if cls is L.ChangeGateClassifier else cls(dropout=0.0, **kw)).to(L.DEVICE)
         ckpt_dir = R.CKPT_DIR / (ck + suffix)
         if not (ckpt_dir / "best.pt").exists():
@@ -428,7 +443,7 @@ def load(lowmid_suffix, high_suffix, mid_suffix=None):
         # ever used to show that the marginal zone over-amplifies in both directions.
         models[b], norms[b] = m, dict(mean=tr.mean, std=tr.std, rld_mean=tr.rld_mean, rld_std=tr.rld_std,
                                       tdps_mean=tr.tdps_mean, tdps_std=tr.tdps_std, cross_mean=tr.cross_mean,
-                                      cross_std=tr.cross_std, feature_set=fs, cross_cols=None)
+                                      cross_std=tr.cross_std, feature_set=fs, cross_cols=None, **_nrm_tos)
     return models, norms
 
 

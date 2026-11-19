@@ -42,7 +42,7 @@ import central_pack_rollout as C
 torch.set_grad_enabled(False)
 # The weight set, from the command line, then SIC_WSET, then the one this repository
 # builds and ml_seaice_v4.jl ships.
-SETS = sys.argv[1:] or [_os.environ.get("SIC_WSET", "hw2curvtanh100lapmtas")] \
+SETS = sys.argv[1:] or [_os.environ.get("SIC_WSET", "wttos")] \
     if (_os := __import__("os")) else []
 
 # (year, seed year, label, is it the same distribution as training)

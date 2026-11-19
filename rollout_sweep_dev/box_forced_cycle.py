@@ -61,10 +61,14 @@ _WSETS = {"hw2curvtanh100": ("_hw2curvtanh100", "_hw2curvtanh100", None),
                   "_hw2curvtanh100selfdist1_dist64_l1_lap"),
           "lap_mtas": ("_hw2curvtanh100zeroprop_lap", "_hw2curvtanh100statemonog0.3_lap",
                        "_hw2curvtanh100selfdist1_dist64_l1_mtas1000_lap"),
-          # the SHIPPED package: mtas100, not the mtas1000 sweep arm above, with the mid
-          # band's student matching the teacher under masking over ("tas","tdps","rld").
+          # mtas100, not the mtas1000 sweep arm above, with the mid band's student matching the
+          # teacher under masking over ("tas","tdps","rld"). Shipped until 2026-11-19.
           "lapmtas": ("_hw2curvtanh100zeroprop_lap", "_hw2curvtanh100statemonog0.3_lap",
-                      "_hw2curvtanh100selfdist1_dist64_l1_mtas100_md_lap")}
+                      "_hw2curvtanh100selfdist1_dist64_l1_mtas100_md_lap"),
+          # the SHIPPED package: the mid band distilled from a teacher that carries the same
+          # coherent-warming penalty, and the high band on the indicator ocean-temperature column.
+          "wttos": ("_hw2curvtanh100zeroprop_lap", "_hw2curvtanh100statemonog0.3_tosindicator3_lap",
+                    "_hw2curvtanh100selfdist1_dist64_l1_wt100_mtas100_md_lap")}
 DEADBAND = float(os.environ.get("DEADBAND", "0"))
 WSET = os.environ.get("WSET", "hw2curvtanh100")
 _LM, _HI, _MID = _WSETS[WSET]
