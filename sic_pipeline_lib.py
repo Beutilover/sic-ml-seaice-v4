@@ -301,18 +301,33 @@ class RelaxationRolloutMultiHistCrossShiftedForcingNoTosDataset(RelaxationRollou
             rld_mean=self.rld_mean, rld_std=self.rld_std, tdps_mean=self.tdps_mean, tdps_std=self.tdps_std,
         )
         sic_idx = base_feat_names.index("siconc")
-        tos_idx = base_feat_names.index("tos")
+        # tos_idx only EXCLUDES tos from the forcing shift, so a feature set without it has nothing
+        # to exclude. -1 never matches a real index and leaves every existing call identical.
+        tos_idx = base_feat_names.index("tos") if "tos" in base_feat_names else -1
         for i in range(len(base_feat_names)):
             if i == sic_idx or i == tos_idx:
                 continue
             self.X[:, i] = future0_norm[:, i]
 
 
-def make_loaders(train_cache_path, val_cache_path, feature_set="all", normalize_phys=True, batch_size=BATCH_SIZE, use_cross=True, cross_cols=None):
+def make_loaders(train_cache_path, val_cache_path, feature_set="all", normalize_phys=True, batch_size=BATCH_SIZE, use_cross=True, cross_cols=None, val_stats_after=False):
     train_ds = RelaxationRolloutMultiHistCrossShiftedForcingNoTosDataset(train_cache_path, feature_set=feature_set, normalize_phys=normalize_phys, use_cross=use_cross, cross_cols=cross_cols)
     override_stats = dict(radsum_mean=train_ds.radsum_mean, radsum_std=train_ds.radsum_std, rld_mean=train_ds.rld_mean, rld_std=train_ds.rld_std,
                            tdps_mean=train_ds.tdps_mean, tdps_std=train_ds.tdps_std)
     override_cross = dict(mean=train_ds.cross_mean, std=train_ds.cross_std)
+    # The base mean/std must be in place BEFORE the dataset normalizes its X, not relabelled
+    # afterward: `self.X` is built in __init__, so assigning `val_ds.mean` on the way out left val's
+    # six base columns (siconc, tos, rsds, rls, sfcwind, tas) scaled by the VAL cache's own
+    # statistics while everything downstream -- the model, the penalty perturbations, the
+    # un-normalization in `collect_predictions` -- assumed TRAIN's. Measured on the high band: at
+    # 2 degrees the two caches agree closely enough that the val objective moves by 0.0001 and val
+    # CORR by 0.001, but at 1 degree the caches' tos statistics differ by a factor of 22, which
+    # pushed that column to +/-3.56 on val where training never saw it past +/-1.22 and cost 0.14
+    # of val CORR outright. `val_stats_after=True` reproduces the earlier behaviour for a
+    # like-for-like comparison against a number recorded before this fix.
+    if not val_stats_after:
+        override_stats["mean"] = train_ds.mean
+        override_stats["std"] = train_ds.std
     val_ds = RelaxationRolloutMultiHistCrossShiftedForcingNoTosDataset(val_cache_path, feature_set=feature_set, normalize_phys=normalize_phys, use_cross=use_cross, cross_cols=cross_cols, override_stats=override_stats, override_cross=override_cross)
     # val must also use TRAIN mean/std (not its own) -- production convention (see project memory)
     val_ds.mean = train_ds.mean; val_ds.std = train_ds.std
