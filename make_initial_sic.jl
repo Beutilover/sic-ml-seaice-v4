@@ -30,6 +30,11 @@
 #   --out        where to write; the file is named after the grid it was built for
 #   --grid       FullGaussianGrid (default) or OctahedralGaussianGrid
 #   --every      history spacing in days, only if the run changes `update_every` from 5
+#   --series-end if given, writes a SERIES instead: every `--every` days from `--start` to this
+#                date inclusive, one block per date, for prescribing the observed concentration
+#                through a spin-up rather than seeding a run. The file is
+#                sic_series_<grid>_<start>_<end>.bin with a .txt beside it listing the dates in
+#                order, and the same remap and the same checks are used for every block.
 #
 # ERA5 is remapped onto the model's grid by AREA MEAN wherever a model cell is coarser than
 # the 1-degree reanalysis, and bilinearly where it is finer. A T31 cell spans about 16 ERA5
@@ -58,7 +63,7 @@ using Printf
 function parse_args(argv)
     opts = Dict{String, String}(
         "trunc" => "63", "start" => "", "processed" => "", "out" => "",
-        "grid" => "FullGaussianGrid", "every" => "5",
+        "grid" => "FullGaussianGrid", "every" => "5", "series-end" => "",
     )
     i = 1
     while i <= length(argv)
@@ -280,9 +285,20 @@ function main(argv)
     println("            $(length(geom.ring_lats)) rings, " *
             "$(minimum(geom.nlon_of_ring))-$(maximum(geom.nlon_of_ring)) points per ring")
 
-    dates = [start - 3 * every, start - 2 * every, start - every, start]
-    names = ("hist3", "hist2", "hist1", "current")
-    out = zeros(Float32, 4 * npoints)
+    series = !isempty(opts["series-end"])
+    if series
+        series_end = Date(opts["series-end"])
+        series_end > start || error("--series-end $(series_end) must be after --start $(start)")
+        dates = collect(start:every:series_end)
+        last(dates) == series_end ||
+            error("$(start) to $(series_end) is not a whole number of $(every) steps; the last " *
+                  "block would be $(last(dates)), and the handoff date has to carry a block")
+        names = [Dates.format(d, "yyyy-mm-dd") for d in dates]
+    else
+        dates = [start - 3 * every, start - 2 * every, start - every, start]
+        names = ("hist3", "hist2", "hist1", "current")
+    end
+    out = zeros(Float32, length(dates) * npoints)
     for (k, (name, date)) in enumerate(zip(names, dates))
         era5 = read_siconc(opts["processed"], date)
         block, nfallback, den = remap(era5, londs, latds, geom)
@@ -318,13 +334,31 @@ function main(argv)
     end
 
     tag = GridType === FullGaussianGrid ? "t$(trunc)" : "t$(trunc)_octahedral"
-    path = joinpath(opts["out"], "initial_sic_$(tag)_$(Dates.format(start, "yyyymmdd")).bin")
+    path = series ?
+        joinpath(opts["out"], "sic_series_$(tag)_$(Dates.format(start, "yyyymmdd"))_" *
+                 "$(Dates.format(last(dates), "yyyymmdd")).bin") :
+        joinpath(opts["out"], "initial_sic_$(tag)_$(Dates.format(start, "yyyymmdd")).bin")
     mkpath(opts["out"])
     open(path, "w") do io
         write(io, out)
     end
-    @printf("\nwrote %s  (%d floats, %d bytes, 4 x %d)\n",
-            path, length(out), length(out) * 4, npoints)
+    @printf("\nwrote %s  (%d floats, %d bytes, %d x %d)\n",
+            path, length(out), length(out) * 4, length(dates), npoints)
+
+    if series
+        # the dates belong WITH the blocks: a consumer that counts them off from the file name
+        # and an assumed spacing has no way to notice a gap in the reanalysis.
+        dates_path = replace(path, ".bin" => ".txt")
+        open(dates_path, "w") do io
+            println(io, "# one date per block, in file order; npoints=$(npoints) per block")
+            for d in dates
+                println(io, Dates.format(d, "yyyy-mm-dd"))
+            end
+        end
+        println("wrote $(dates_path)  ($(length(dates)) dates)")
+        println("MAKE_SIC_SERIES_DONE")
+        return nothing
+    end
 
     # the four blocks must be 5 days apart in TIME, not four copies of one map: a file whose
     # blocks are identical gives the networks a zero tendency history and the first cycle
