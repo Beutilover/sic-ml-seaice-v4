@@ -1,34 +1,18 @@
 """
-Native Julia re-implementation of the gradient-basis-cross candidate checkpoints (2026-08-26, see
-`hemisphere_unified_gradbasis_mono_variants.ipynb`): identical `ChangeGateClassifier`/
-`RelaxationMoEClassifier` architecture and rld-based radiation input to `ml_seaice_model_v3.jl`,
-differing only in what the cross-neighbor columns hold -- 2 columns `[(N-S)/2, (W-E)/2]` (a clean
-centered-difference gradient per axis) here, in place of V3's 4 raw redundant `[N,S,W,E]` columns.
-This was found to substantially reduce the near-pole "spoke" streaking artifact in offline rollout
-diagnostics (south d_dt=0: CORR 0.7386->0.9333, mean local-anomaly 0.0926->0.0240; north d_dt=0:
-CORR 0.9171->0.9670, anomaly 0.0154->0.0039 -- see the notebook). The joint (sum) mono-penalty
-formulation is used (tied with a separate-penalty variant after independent gate re-sweeping, see
-the same notebook), so weight semantics otherwise match V3's `unified_low_gradbasis_cross`/
-`unified_mid_gradbasis_cross`/`north_high_gradbasis_cross` checkpoints exactly.
+Neural sea-ice concentration tendency models for SpeedyWeather.jl.
 
-This is a purely ADDITIVE module: it does not modify, import from, or get imported by
-`ml_seaice_model.jl` / `ml_seaice_model_v2.jl` / `ml_seaice_model_v3.jl` in any way. V1/V2/V3
-weights/behavior are untouched -- this duplicates rather than shares V3's (structurally identical,
-cross-width-agnostic) normalize/forward code, matching this project's established convention of
-keeping each ML sea-ice version fully independent.
+This module loads exported PyTorch weights and evaluates two relaxation-based
+architectures: a change-gated model and a model with separate ice-growth and
+ice-loss branches. A four-layer GELU backbone processes meteorological and
+sea-ice features, while a momentum network processes three recent SIC changes.
 
-Model recap (identical math to `MLSeaIceModelV3`, only the cross-neighbor columns' physical meaning
-differs):
-    h = backbone(x)                                   # 4x(Linear+GELU), width 64
-    diffs = hist[2:end] .- hist[1:end-1] (append sic_raw as last point)
-    mom = momentum_mlp(diffs)                          # Linear+GELU, width 16
-    combined = [h; mom]                                # 80-d
-    class_logits = class_head(combined)
-    ... (inc/dec heads or single changed_head, exactly as in MLSeaIceModelV3)
+Inputs include SIC, ocean surface temperature (when available), shortwave and
+downwelling longwave radiation, surface wind, air temperature, optional dewpoint,
+and centred north-south and west-east SIC differences. Model-specific ocean
+temperature indicators are specified by the exported weight package.
 
-Raw input feature order (before normalization): [siconc, tos, rsds, rld, sfcwind, tas], then 2
-cross-neighbor gradient columns [(N-S)/2, (W-E)/2], then OPTIONALLY tdps (2m dewpoint) as the final
-column -- present for the unified low/mid bands, absent for north_high (same convention as V3).
+The module provides feature normalisation, weight loading, standard inference,
+and allocation-free inference using flat, device-transferable weights.
 """
 module MLSeaIceModelV4
 
@@ -82,6 +66,20 @@ struct MLWeightsV4
     has_tdps::Bool
     tdps_mean::Float32
     tdps_std::Float32
+    has_tos::Bool
+    # The tos COLUMN's form. The ocean temperature the reanalysis reports under ice is
+    # a fill value, the seawater freezing point, for most of a dense-ice band's training rows, and
+    # the real ocean temperatures sit 3.05e-05 K above it -- 3.5e-05 of the affine column's span.
+    # `tos_form = 1` ("indicator") spends that span differently: the column becomes
+    # tanh((tos - tos_centre) / tos_scale), which is NOT divided by norm_std, and ONE extra input is
+    # appended at the very end carrying the above-fill bit, (tos - tos_centre) > tos_tol. The form
+    # is DECLARED in tos_column.txt beside the weights rather than inferred, because the resulting
+    # width matches neither of the two layouts _infer_has_tos knows. `tos_form = 0` is the affine
+    # column every package before this date carries.
+    tos_form::Int32
+    tos_centre::Float32
+    tos_scale::Float32
+    tos_tol::Float32
 end
 
 struct MLWeightsChangeGateV4
@@ -103,6 +101,20 @@ struct MLWeightsChangeGateV4
     has_tdps::Bool
     tdps_mean::Float32
     tdps_std::Float32
+    has_tos::Bool
+    # The tos COLUMN's form. The ocean temperature the reanalysis reports under ice is
+    # a fill value, the seawater freezing point, for most of a dense-ice band's training rows, and
+    # the real ocean temperatures sit 3.05e-05 K above it -- 3.5e-05 of the affine column's span.
+    # `tos_form = 1` ("indicator") spends that span differently: the column becomes
+    # tanh((tos - tos_centre) / tos_scale), which is NOT divided by norm_std, and ONE extra input is
+    # appended at the very end carrying the above-fill bit, (tos - tos_centre) > tos_tol. The form
+    # is DECLARED in tos_column.txt beside the weights rather than inferred, because the resulting
+    # width matches neither of the two layouts _infer_has_tos knows. `tos_form = 0` is the affine
+    # column every package before this date carries.
+    tos_form::Int32
+    tos_centre::Float32
+    tos_scale::Float32
+    tos_tol::Float32
 end
 
 function _read_bin(dir::String, fname::AbstractString, shape)
@@ -130,6 +142,72 @@ function _read_manifest(dir::String)
     end
     return tensors
 end
+    # Maintain compatibility with the exported weight layout.
+MLWeightsV4(W, b, Wm, bm, Wc, bc, Wi, bi, Wd, bd, tau_inc, tau_dec, tau_floor, dt,
+            norm_mean, norm_std, cross_mean, cross_std, rld_mean, rld_std,
+            has_tdps, tdps_mean, tdps_std, has_tos) =
+    MLWeightsV4(W, b, Wm, bm, Wc, bc, Wi, bi, Wd, bd, tau_inc, tau_dec, tau_floor, dt,
+                norm_mean, norm_std, cross_mean, cross_std, rld_mean, rld_std,
+                has_tdps, tdps_mean, tdps_std, has_tos, Int32(0), 0f0, 1f0, 0f0)
+
+MLWeightsChangeGateV4(W, b, Wm, bm, Wc, bc, Wch, bch, tau_changed, tau_floor, dt,
+                      norm_mean, norm_std, cross_mean, cross_std, rld_mean, rld_std,
+                      has_tdps, tdps_mean, tdps_std, has_tos) =
+    MLWeightsChangeGateV4(W, b, Wm, bm, Wc, bc, Wch, bch, tau_changed, tau_floor, dt,
+                          norm_mean, norm_std, cross_mean, cross_std, rld_mean, rld_std,
+                          has_tdps, tdps_mean, tdps_std, has_tos, Int32(0), 0f0, 1f0, 0f0)
+
+"""Read the ocean-temperature feature declaration from a weight package.
+If absent, use the affine ocean-temperature representation."""
+function read_tos_declaration(dir::String)
+    path = joinpath(dir, "tos_column.txt")
+    isfile(path) || return (; tos_form = Int32(0), tos_centre = 0f0, tos_scale = 1f0, tos_tol = 0f0)
+    kv = Dict{String, String}()
+    for line in eachline(path)
+        line = strip(line)
+        (isempty(line) || startswith(line, "#")) && continue
+        parts = split(line, '='; limit = 2)
+        length(parts) == 2 || error("$(path): cannot parse line \"$(line)\"")
+        kv[strip(parts[1])] = strip(parts[2])
+    end
+    form = get(kv, "tos_form", "affine")
+    form == "affine" && return (; tos_form = Int32(0), tos_centre = 0f0, tos_scale = 1f0, tos_tol = 0f0)
+    form == "indicator" || error("$(path): unknown tos_form \"$(form)\"")
+    return (; tos_form = Int32(1),
+            tos_centre = parse(Float32, kv["tos_centre"]),
+            tos_scale = parse(Float32, kv["tos_scale"]),
+            tos_tol = parse(Float32, kv["tos_tol"]))
+end
+
+# has_tos. A band may be trained WITHOUT the ocean temperature column -- in the high
+# band tos is the seawater freezing point the reanalysis reports under ice for 98% of the training
+# rows, so it is not identifiable there and the column is dropped rather than normalised. Which
+# layout a package carries is DETERMINED by the first layer's input width, so nothing new has to be
+# written beside the weights and every existing package reads back exactly as before:
+#     with tos      in_dim = 6 + has_tdps + n_cross
+#     without tos   in_dim = 5 + has_tdps + n_cross
+# The two differ by one for every band in this project (high 9 or 8, low and mid 10 or 9), so the
+# inference is unambiguous. A width matching NEITHER layout is a packaging error and raises here
+# instead of silently feeding the network a shifted feature vector, which is the failure mode that
+    # Preserve the feature ordering and normalisation conventions of the exported weights.
+function _infer_has_tos(W1, n_cross::Int, has_tdps::Bool, tos_form::Int32 = Int32(0))
+    # _read_bin stores a PyTorch (out, in) tensor as a Julia (in, out) matrix, because the forward
+    # pass applies W', so the INPUT width is the FIRST dimension.
+    in_dim = size(W1, 1)
+    n_tdps = has_tdps ? 1 : 0
+    # the indicator form keeps the tos column AND appends the above-fill bit, so it is one wider
+    # than the plain with-tos layout. It is declared, never inferred: without the declaration this
+    # width is a packaging error, which is exactly what the error below says.
+    n_flag = tos_form == Int32(1) ? 1 : 0
+    with_tos = 6 + n_tdps + n_cross + n_flag
+    without_tos = 5 + n_tdps + n_cross
+    in_dim == with_tos && return true
+    tos_form == Int32(0) && in_dim == without_tos && return false
+    error("ML sea-ice weights: first layer expects in_dim=$in_dim, which matches neither the " *
+          "with-tos layout ($with_tos) nor the without-tos layout ($without_tos) for " *
+          "n_cross=$n_cross, has_tdps=$has_tdps, tos_form=$tos_form. The package is " *
+          "inconsistent with its own normalisation arrays.")
+end
 
 function load_ml_weights_v4(dir::String; tau_floor::Float32=1.0f0, dt::Float32=5.0f0)
     tensors = _read_manifest(dir)
@@ -140,6 +218,7 @@ function load_ml_weights_v4(dir::String; tau_floor::Float32=1.0f0, dt::Float32=5
     has_tdps = haskey(tensors, "norm.tdps_mean")
     tdps_mean = has_tdps ? tensors["norm.tdps_mean"] : 0f0
     tdps_std = has_tdps ? tensors["norm.tdps_std"] : 1f0
+    tosdecl = read_tos_declaration(dir)
 
     return MLWeightsV4(
         W, b,
@@ -153,6 +232,8 @@ function load_ml_weights_v4(dir::String; tau_floor::Float32=1.0f0, dt::Float32=5
         tensors["norm.cross_mean"], tensors["norm.cross_std"],
         tensors["norm.rld_mean"], tensors["norm.rld_std"],
         has_tdps, Float32(tdps_mean), Float32(tdps_std),
+        _infer_has_tos(W[1], length(tensors["norm.cross_mean"]), has_tdps, tosdecl.tos_form),
+        tosdecl.tos_form, tosdecl.tos_centre, tosdecl.tos_scale, tosdecl.tos_tol,
     )
 end
 
@@ -165,6 +246,7 @@ function load_ml_weights_changegate_v4(dir::String; tau_floor::Float32=1.0f0, dt
     has_tdps = haskey(tensors, "norm.tdps_mean")
     tdps_mean = has_tdps ? tensors["norm.tdps_mean"] : 0f0
     tdps_std = has_tdps ? tensors["norm.tdps_std"] : 1f0
+    tosdecl = read_tos_declaration(dir)
 
     return MLWeightsChangeGateV4(
         W, b,
@@ -177,6 +259,8 @@ function load_ml_weights_changegate_v4(dir::String; tau_floor::Float32=1.0f0, dt
         tensors["norm.cross_mean"], tensors["norm.cross_std"],
         tensors["norm.rld_mean"], tensors["norm.rld_std"],
         has_tdps, Float32(tdps_mean), Float32(tdps_std),
+        _infer_has_tos(W[1], length(tensors["norm.cross_mean"]), has_tdps, tosdecl.tos_form),
+        tosdecl.tos_form, tosdecl.tos_centre, tosdecl.tos_scale, tosdecl.tos_tol,
     )
 end
 
@@ -195,20 +279,37 @@ end
 # collapse to near-zero within months; caught by comparing online Rld values directly against the
 # exported norm stats. See export_v3_weights.py's pooled_norm_low_mid docstring for the full story.
 # ---------------------------------------------------------------------------
-function _normalize_base(m, s, rld_mean, rld_std, siconc, tos, rsds, rld, sfcwind, tas)
+function _normalize_base(m, s, rld_mean, rld_std, siconc, tos, rsds, rld, sfcwind, tas,
+                         has_tos::Bool=true, tos_form::Int32=Int32(0),
+                         tos_centre::Float32=0f0, tos_scale::Float32=1f0)
     f_sic = (siconc - m[1]) / max(s[1], 1f-6)
-    f_tos = (tos - m[2]) / max(s[2], 1f-6)
     f_rsds = (rsds - m[3]) / max(s[3], 1f-6)
     f_rld = (rld - rld_mean) / max(rld_std, 1f-6)
     f_wind = (sfcwind - m[5]) / max(s[5], 1f-6)
     f_tas = (tas - m[6]) / max(s[6], 1f-6)
+    # tos keeps slot 2 of the normalisation arrays whether or not the band uses it, so a package
+    # that drops the column needs no change to norm.mean / norm.std.
+    has_tos || return Float32[f_sic, f_rsds, f_rld, f_wind, f_tas]
+    # the indicator column is tanh of the excess over the fill value and is NOT standardised: the
+    # training side overwrites the already-normalised column with this value, so norm_mean[2] and
+    # norm_std[2] play no part in it.
+    f_tos = tos_form == Int32(1) ? tanh((tos - tos_centre) / tos_scale) :
+            (tos - m[2]) / max(s[2], 1f-6)
     return Float32[f_sic, f_tos, f_rsds, f_rld, f_wind, f_tas]
 end
 
+# the appended above-fill bit, empty for every other form. It goes LAST, after the cross columns,
+# which is where the training side appends it (after `fn` has been read, so no index shifts).
+@inline function _tos_flag(w, tos)
+    w.tos_form == Int32(1) || return Float32[]
+    return Float32[(tos - w.tos_centre) > w.tos_tol ? 1f0 : 0f0]
+end
+
 function ml_normalize_features_v4(w::MLWeightsV4, siconc, tos, rsds, rld, sfcwind, tas, tdps, cross::NTuple{N,Float32}) where N
-    base = _normalize_base(w.norm_mean, w.norm_std, w.rld_mean, w.rld_std, siconc, tos, rsds, rld, sfcwind, tas)
+    base = _normalize_base(w.norm_mean, w.norm_std, w.rld_mean, w.rld_std, siconc, tos, rsds, rld, sfcwind, tas,
+                           w.has_tos, w.tos_form, w.tos_centre, w.tos_scale)
     cross_norm = ntuple(i -> (cross[i] - w.cross_mean[i]) / max(w.cross_std[i], 1f-6), N)
-    # [2026-09-29 BUG FIX] tdps goes BEFORE the cross columns, not after.
+    # tdps goes BEFORE the cross columns, not after.
     # sic_pipeline_lib.build_feature_matrix_from_raw emits the base features in the order of the
     # feature-set string -- "sic+sst+rsds+rld+sfcwind+tas+tdps" -- and the cross columns are
     # concatenated AFTER that, so the layout the weights were trained on is
@@ -224,17 +325,19 @@ function ml_normalize_features_v4(w::MLWeightsV4, siconc, tos, rsds, rld, sfcwin
     # 7 significant figures. EVERY online result produced before this date is affected; offline
     # training and evaluation never were, because both sides there call the same Python builder.
     # Regression test: test/parameterizations/ml_seaice_v4_feature_order.jl
+    flag = _tos_flag(w, tos)
     if w.has_tdps
         f_tdps = (tdps - w.tdps_mean) / max(w.tdps_std, 1f-6)
-        return vcat(base, Float32[f_tdps], collect(Float32, cross_norm))
+        return vcat(base, Float32[f_tdps], collect(Float32, cross_norm), flag)
     end
-    return vcat(base, collect(Float32, cross_norm))
+    return vcat(base, collect(Float32, cross_norm), flag)
 end
 
 function ml_normalize_features_v4(w::MLWeightsChangeGateV4, siconc, tos, rsds, rld, sfcwind, tas, tdps, cross::NTuple{N,Float32}) where N
-    base = _normalize_base(w.norm_mean, w.norm_std, w.rld_mean, w.rld_std, siconc, tos, rsds, rld, sfcwind, tas)
+    base = _normalize_base(w.norm_mean, w.norm_std, w.rld_mean, w.rld_std, siconc, tos, rsds, rld, sfcwind, tas,
+                           w.has_tos, w.tos_form, w.tos_centre, w.tos_scale)
     cross_norm = ntuple(i -> (cross[i] - w.cross_mean[i]) / max(w.cross_std[i], 1f-6), N)
-    # [2026-09-29 BUG FIX] tdps goes BEFORE the cross columns, not after.
+    # tdps goes BEFORE the cross columns, not after.
     # sic_pipeline_lib.build_feature_matrix_from_raw emits the base features in the order of the
     # feature-set string -- "sic+sst+rsds+rld+sfcwind+tas+tdps" -- and the cross columns are
     # concatenated AFTER that, so the layout the weights were trained on is
@@ -250,11 +353,12 @@ function ml_normalize_features_v4(w::MLWeightsChangeGateV4, siconc, tos, rsds, r
     # 7 significant figures. EVERY online result produced before this date is affected; offline
     # training and evaluation never were, because both sides there call the same Python builder.
     # Regression test: test/parameterizations/ml_seaice_v4_feature_order.jl
+    flag = _tos_flag(w, tos)
     if w.has_tdps
         f_tdps = (tdps - w.tdps_mean) / max(w.tdps_std, 1f-6)
-        return vcat(base, Float32[f_tdps], collect(Float32, cross_norm))
+        return vcat(base, Float32[f_tdps], collect(Float32, cross_norm), flag)
     end
-    return vcat(base, collect(Float32, cross_norm))
+    return vcat(base, collect(Float32, cross_norm), flag)
 end
 
 # ---------------------------------------------------------------------------
@@ -348,7 +452,7 @@ function ml_forward_v4(w::MLWeightsV4, x::Vector{Float32}, sic_raw::Float32, his
 end
 
 # ===========================================================================================
-# [2026-11-11] GPU-ready flat weights and an allocation-free forward pass.
+# GPU-ready flat weights and an allocation-free forward pass.
 #
 # The forward pass above is written for clarity and allocates about ten times per grid point per
 # band: `h = gelu(w.W[l]' * h .+ w.b[l])` builds a fresh Vector on every one of the four layers,
@@ -404,6 +508,10 @@ struct MLWeightsFlatV4{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32
     H::Int
     Mm::Int
     ncross::Int
+    tos_form::Int32
+    tos_centre::Float32
+    tos_scale::Float32
+    tos_tol::Float32
 end
 
 struct MLWeightsFlatChangeGateV4{V <: AbstractVector{Float32}, M <: AbstractMatrix{Float32}, A3 <: AbstractArray{Float32, 3}}
@@ -433,6 +541,10 @@ struct MLWeightsFlatChangeGateV4{V <: AbstractVector{Float32}, M <: AbstractMatr
     H::Int
     Mm::Int
     ncross::Int
+    tos_form::Int32
+    tos_centre::Float32
+    tos_scale::Float32
+    tos_tol::Float32
 end
 
 # the backbone's H->H layers are stacked; every matrix is already stored (in, out) by _read_bin
@@ -466,6 +578,7 @@ function flatten_weights_v4(w::MLWeightsV4)
         copy(w.norm_mean), copy(w.norm_std), copy(w.cross_mean), copy(w.cross_std),
         w.rld_mean, w.rld_std, w.has_tdps, w.tdps_mean, w.tdps_std,
         nin, H, Mm, length(w.cross_mean),
+        w.tos_form, w.tos_centre, w.tos_scale, w.tos_tol,
     )
 end
 
@@ -482,6 +595,7 @@ function flatten_weights_v4(w::MLWeightsChangeGateV4)
         copy(w.norm_mean), copy(w.norm_std), copy(w.cross_mean), copy(w.cross_std),
         w.rld_mean, w.rld_std, w.has_tdps, w.tdps_mean, w.tdps_std,
         nin, H, Mm, length(w.cross_mean),
+        w.tos_form, w.tos_centre, w.tos_scale, w.tos_tol,
     )
 end
 
@@ -499,13 +613,13 @@ const MLWeightsFlatV4CPU = MLWeightsFlatV4{Vector{Float32}, Matrix{Float32}, Arr
 const MLWeightsFlatChangeGateV4CPU = MLWeightsFlatChangeGateV4{Vector{Float32}, Matrix{Float32}, Array{Float32, 3}}
 
 # --- normalisation, written straight into a scratch column -----------------------------------
-# Feature layout, as the training pipeline emits it (see the 2026-09-29 note above):
-#     [sic, tos, rsds, rld, sfcwind, tas, (tdps), cross...]
+    # Preserve the feature ordering and normalisation conventions of the exported weights.
 @inline function ml_normalize_flat_v4!(xb, ij, w, siconc, tos, rsds, rld, sfcwind, tas, tdps,
                                        c1::Float32, c2::Float32, c3::Float32)
     m = w.norm_mean; s = w.norm_std
     xb[1, ij] = (siconc - m[1]) / max(s[1], 1f-6)
-    xb[2, ij] = (tos - m[2]) / max(s[2], 1f-6)
+    xb[2, ij] = w.tos_form == Int32(1) ? tanh((tos - w.tos_centre) / w.tos_scale) :
+                (tos - m[2]) / max(s[2], 1f-6)
     xb[3, ij] = (rsds - m[3]) / max(s[3], 1f-6)
     xb[4, ij] = (rld - w.rld_mean) / max(w.rld_std, 1f-6)
     xb[5, ij] = (sfcwind - m[5]) / max(s[5], 1f-6)
@@ -520,6 +634,8 @@ const MLWeightsFlatChangeGateV4CPU = MLWeightsFlatChangeGateV4{Vector{Float32}, 
     nc >= 1 && (xb[k + 1, ij] = (c1 - cm[1]) / max(cs[1], 1f-6))
     nc >= 2 && (xb[k + 2, ij] = (c2 - cm[2]) / max(cs[2], 1f-6))
     nc >= 3 && (xb[k + 3, ij] = (c3 - cm[3]) / max(cs[3], 1f-6))
+    # the above-fill bit goes last, in the slot the declared width accounts for
+    w.tos_form == Int32(1) && (xb[k + nc + 1, ij] = (tos - w.tos_centre) > w.tos_tol ? 1f0 : 0f0)
     return nothing
 end
 
